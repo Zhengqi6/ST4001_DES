@@ -1,0 +1,38 @@
+\centerline{\xiaoyi\bfseries Abstract}
+\vspace{4em}
+
+(main text: Times New Roman, size 12, double linespace. Reference is cited by number in square brackets. Paragraph alignment: fully justified.)
+
+x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x x
+
+\begin{abstract}
+This thesis presents the development of a comprehensive software framework for optimizing low-carbon Distributed Energy Systems (DES) with a focus on carbon-aware decision-making. The system integrates DES operational modeling, carbon price scenario generation, financial carbon option pricing, and Real Option Analysis (ROA) for strategic investments. The primary objective is to provide a tool for evaluating both operational hedging strategies against carbon price volatility and the value of managerial flexibility in long-term, capital-intensive low-carbon projects, such as Carbon Capture and Storage (CCS).
+
+The framework is implemented in Python, employing a modular architecture. Key modules include a Pyomo-based DES optimizer for minimizing operational costs (including carbon costs) of a system with Combined Heat and Power (CHP), Photovoltaics (PV), and Battery Energy Storage (BESS); a carbon pricer utilizing Geometric Brownian Motion (GBM) and GARCH models to simulate carbon price uncertainties; a financial option pricer based on the Black-Scholes model for valuing European carbon options; and an ROA module using binomial lattices to assess the deferral option for CCS investments.
+
+A case study, orchestrated by a central script, demonstrates the end-to-end functionality of the framework using synthetically generated data. It showcases the system's capability to perform DES dispatch optimization, generate carbon price scenarios, price financial options, and evaluate strategic investments through ROA, thereby quantifying the value of flexibility.
+
+The thesis details the design principles, module implementations, and illustrative results from the case study. While the current version relies on synthetic data and some model simplifications, it establishes a robust foundation. Future enhancements include integration with real-world data sources, implementation of more advanced financial and operational models (e.g., stochastic programming, sophisticated carbon price processes, advanced option pricing models), comprehensive validation, and development of sophisticated decision control logic. 
+
+This work contributes a research-grade platform to support analysis and decision-making in the transition towards sustainable and economically viable low-carbon energy systems, particularly highlighting the strategic role of carbon pricing, financial hedging, and real options.
+
+\textbf{Keywords}: Distributed Energy Systems (DES), Low-Carbon Optimization, Carbon Pricing, Financial Carbon Options, Real Option Analysis (ROA), Carbon Capture and Storage (CCS), Pyomo, GARCH.
+
+\end{abstract}
+
+\begin{abstract}[lang=cn]
+% Chinese Abstract - Placeholder
+本论文介绍了一个综合性软件框架的开发，该框架用于优化低碳分布式能源系统（DES），并重点关注碳感知决策。该系统集成了DES运营建模、碳价格情景生成、金融碳期权定价以及针对战略投资的实物期权分析（ROA）。主要目标是提供一个工具，用于评估应对碳价格波动的运营对冲策略，以及如碳捕集与封存（CCS）等长期资本密集型低碳项目中管理灵活性的价值。
+
+该框架采用Python实现，具有模块化架构。关键模块包括：一个基于Pyomo的DES优化器，用于最小化包含热电联产（CHP）、光伏（PV）和电池储能（BESS）的系统的运营成本（含碳成本）；一个碳定价器，利用几何布朗运动（GBM）和GARCH模型模拟碳价格不确定性；一个基于Black-Scholes模型的金融期权定价器，用于评估欧式碳期权价值；以及一个实物期权分析模块，使用二叉树模型评估CCS投资的延迟期权价值。
+
+通过一个由中央脚本编排的案例研究，使用综合生成的数据展示了框架的端到端功能。它显示了系统在执行DES调度优化、生成碳价格情景、金融期权定价以及通过ROA评估战略投资（从而量化灵活性价值）方面的能力。
+
+论文详细介绍了设计原则、模块实现以及案例研究的示例性结果。尽管当前版本依赖于综合数据和一些模型简化，但它建立了一个坚实的基础。未来的增强方向包括与真实世界数据源的集成、更先进的金融和运营模型（例如，随机规划、复杂的碳价格过程、高级期权定价模型）的实施、全面的验证以及复杂决策控制逻辑的开发。
+
+本研究贡献了一个研究级平台，以支持在向可持续和经济可行的低碳能源系统转型过程中的分析和决策，尤其强调了碳定价、金融对冲和实物期权的战略作用。
+
+\textbf{关键词}：分布式能源系统（DES），低碳优化，碳定价，金融碳期权，实物期权分析（ROA），碳捕集与封存（CCS），Pyomo，GARCH。
+\end{abstract}
+
+

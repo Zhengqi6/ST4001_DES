@@ -1,0 +1,41 @@
+\chapter{Introduction}
+\label{chap:introduction}
+
+This thesis presents the design, implementation, and analysis of a software framework for the optimization of low-carbon Distributed Energy Systems (DES). The core objective is to translate the theoretical framework detailed in the foundational project document (ST4001.md) into a functional system capable of evaluating operational and strategic decisions under carbon pricing mechanisms. This includes the use of financial carbon options for operational hedging and Real Option Analysis (ROA) for strategic investments, particularly focusing on technologies like Carbon Capture and Storage (CCS).
+
+\section{Background and Motivation}
+
+The transition towards a low-carbon energy future necessitates sophisticated planning and operational strategies for DES. These systems, often comprising a mix of renewable energy sources (RES), conventional generation (e.g., Combined Heat and Power - CHP), and energy storage (e.g., Battery Energy Storage Systems - BESS), face multifaceted challenges. Key among these are the intermittency of RES, volatility in energy demands, and the increasing impact of carbon pricing policies. Effective management requires tools that can navigate these uncertainties and optimize both economic performance and environmental goals.
+
+Traditional Net Present Value (NPV) analysis often falls short in valuing managerial flexibility inherent in long-term, capital-intensive projects under uncertainty. Real Option Analysis provides a more robust framework for such evaluations. Concurrently, the volatility of carbon markets introduces significant operational risks, which can potentially be hedged using financial instruments like carbon options.
+
+\section{Core Objectives and Guiding Principles}
+
+This research and development effort aims to create a software tool that operationalizes the concepts presented in ST4001.md. The primary goals are:
+\begin{itemize}
+    \item To develop a DES optimization model that minimizes operational costs while accounting for carbon emissions under various carbon pricing scenarios.
+    \item To implement models for generating realistic carbon price scenarios, capturing their inherent volatility using methods like Geometric Brownian Motion (GBM) and GARCH.
+    \item To price financial carbon options (e.g., European call options) based on these scenarios to assess their utility for operational hedging.
+    \item To apply Real Option Analysis, using techniques like binomial lattices, to evaluate strategic investments, such as the deferral option for a CCS project.
+    \item To integrate these components into a cohesive framework that allows for end-to-end case study simulations.
+\end{itemize}
+
+The development is guided by the following principles, derived from ST4001.md:
+\begin{enumerate}
+    \item \textbf{Dual Focus}: Clearly distinguishing between operational hedging with financial carbon options and strategic investment appraisal using ROA, while exploring their synergies.
+    \item \textbf{Centrality of Uncertainty}: Treating uncertainties (RES intermittency, demand fluctuations, carbon price volatility, policy evolution) as core modeling elements.
+    \item \textbf{Advanced Analytical Methods}: Prioritizing sophisticated techniques that capture real-world complexities over overly simplistic models.
+    \item \textbf{Phased Integration}: Employing a modular design and staged implementation, starting with robust individual components and progressively moving towards full integration.
+\end{enumerate}
+
+\section{The \"Triple Integration\" Challenge}
+
+A central challenge, as identified in ST4001.md, is the \"triple integration\" of three complex domains:
+\begin{enumerate}
+    \item \textbf{DES/IES Physical Modeling}: Accurately representing the operational characteristics of diverse energy assets (PV, CHP, BESS, CCS) and their interconnections.
+    \item \textbf{Energy and Carbon Market Dynamics}: Simulating the interaction of the DES with external markets, including electricity markets and carbon markets (ETS or carbon tax).
+    \item \textbf{Carbon Finance Instruments and Valuation}: Integrating financial engineering models for carbon derivatives pricing and strategic valuation frameworks like ROA.
+\end{enumerate}
+Managing the inherent complexity and capturing the strong interdependencies between these layers is a critical aspect of this work. The software architecture, detailed in the subsequent chapter, is designed to address this challenge through modularity and well-defined data flows.
+
+This thesis will detail the implemented modules, the case study designed to test the integrated system, the results obtained, and discuss potential avenues for future research and enhancement. The aim is to provide a research-grade platform that can support decision-making in the planning and operation of low-carbon energy systems.

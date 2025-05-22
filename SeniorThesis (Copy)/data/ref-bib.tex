@@ -1,0 +1,39 @@
+\clearpage
+
+\renewcommand{\bibname}{\xiaoyi\bf\vspace{5pt} References}
+\phantomsection
+\addcontentsline{toc}{chapter}{References}
+\bibliographystyle{IEEEtran}
+\setstretch{1.25}
+
+\normalem
+\bibliography{ref}
+\doublespacing
+
+% Bibliography - Please add your BibTeX entries here or use a .bib file and \bibliography{your_bib_file_name}
+\chapter*{References}
+
+% Example entry:
+% \begin{thebibliography}{9}
+% \bibitem{einstein}
+% Albert Einstein. 
+% \textit{Zur Elektrodynamik bewegter K{\"o}rper}. 
+% Annalen der Physik, 322(10):891–921, 1905.
+% \end{thebibliography}
+
+% If using a .bib file (e.g., references.bib):
+ \bibliographystyle{ieeetr} % Or another style like plain, unsrt, alpha
+ \bibliography{references} % Assuming your .bib file is named references.bib and is in the same directory or data/
+
+% You will need to create a references.bib file in the data/ directory with your BibTeX entries.
+% Example references.bib content:
+% @article{knuth1984,
+%    author  = {Donald E. Knuth},
+%    title   = {Literate Programming},
+%    journal = {The Computer Journal},
+%    volume  = {27},
+%    number  = {2},
+%    pages   = {97--111},
+%    year    = {1984},
+%    DOI     = {10.1093/comjnl/27.2.97}
+% }

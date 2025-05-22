@@ -1,0 +1,61 @@
+% 编译命令：xelatex main.tex
+
+\documentclass[filled]{zjuthesis}% 填入filled参数，自动填写Checklist表格相关信息
+
+\usepackage{amsmath}
+\usepackage[ruled,vlined,linesnumbered]{algorithm2e}
+\usepackage{pgfgantt}
+\usepackage{geometry}
+\usepackage[table]{xcolor}
+\usepackage{array}
+\usepackage{float}
+
+
+\usepackage{tikz-timing}
+
+\begin{document}
+
+\zju{
+    title = {Optimization of Low-Carbon Distributed Energy Systems with Carbon Options and Real Option Analysis},
+    name = {},
+    id = {},
+    supervisor = {},
+    class of year = {},
+    major = {},
+    submission date = {},
+    Academic title = {},
+}
+
+\maketitle
+
+\frontmatter
+
+\Checklist
+\Commitment
+
+{\doublespacing
+\include{data/ack}
+\include{data/abstract}}
+
+\tableofcontents
+
+\mainmatter
+
+{\doublespacing
+\include{data/intro}
+\include{data/methods}
+\include{data/benchmark}
+\include{data/conclusion}
+}
+
+% 使用bib方式插入参考文献，
+\include{data/ref-bib}
+
+% 直接插入参考文献，
+% \include{data/ref}
+
+\include{data/appendix}
+\include{data/biography}
+
+
+\end{document}

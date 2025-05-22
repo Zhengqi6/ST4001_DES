@@ -1,0 +1,108 @@
+\chapter{Methodology and System Implementation}
+\label{chap:methods}
+
+This chapter details the system architecture, the chosen technology stack, and the implementation of the core modules of the software framework. The design emphasizes modularity, extensibility, and a phased integration approach to tackle the complexity of the \"triple integration\" challenge.
+
+\section{System Architecture and Technology Stack}
+
+\subsection{Overall Architectural Philosophy}
+The software system adheres to a modular architecture, as advocated in ST4001.md. Each core functional area (DES modeling, carbon price simulation, option pricing, ROA, decision logic) is encapsulated within distinct, independently testable modules. This approach facilitates parallel development, simplifies debugging, and enhances maintainability and future extensibility. Communication between modules is intended to be API-driven, primarily using Python class methods and standardized data structures like Pandas DataFrames.
+
+\subsection{Programming Environment}
+Python (version 3.9+) was selected as the primary development language due to its extensive ecosystem of libraries for scientific computing, data analysis, optimization, and financial engineering. Key libraries utilized include:
+\begin{itemize}
+    \item \textbf{Optimization Modeling}: Pyomo for constructing and solving DES optimization models (MILP).
+    \item \textbf{Numerical Computing and Data Handling}: NumPy for numerical operations, Pandas for managing time-series data and structured results.
+    \item \textbf{Time Series and Financial Modeling}: SciPy for general scientific computations, and `arch` for GARCH model implementation (via `statsmodels` indirectly or directly).
+    \item \textbf{Plotting}: Matplotlib for generating static visualizations of results.
+\end{itemize}
+A virtual environment was used to manage project dependencies, ensuring reproducibility, with requirements listed in `requirements.txt`.
+
+\subsection{Optimization Solvers}
+The DES optimization module, built with Pyomo, requires a Mixed Integer Linear Programming (MILP) solver. The system is designed to be compatible with common solvers like CBC (Coin-or Branch and Cut), which is open-source and widely available. While commercial solvers like Gurobi or CPLEX could offer performance benefits for larger, more complex instances, CBC was deemed sufficient for the case study presented.
+
+\section{Module Implementation}
+
+The project is structured into several Python modules, each responsible for a specific part of the overall analysis. The main modules and their functionalities are described below, aligning with Section VI of ST4001.md and our experimental setup.
+
+\subsection{Data Preparation (`src/utils/data_preparation.py`)}
+This module is responsible for defining constants and generating synthetic data for the case study. Key functionalities include:
+\begin{itemize}
+    \item Definition of system parameters: PV capacity, CHP technical specifications (efficiency, capacity, ramp rates, fuel costs), BESS parameters (capacity, charge/discharge efficiency, power rating), market prices (electricity purchase/sale, natural gas), carbon price, and ROA project details (CCS investment cost, project lifetime, discount rate).
+    \item Generation of synthetic hourly data for one year for:
+    \begin{itemize}
+        \item Electricity demand (`load_electricity_demand()`)
+        \item Heat demand (`load_heat_demand()`)
+        \item PV generation factor (`load_pv_generation_factor()`)
+    \end{itemize}
+    \item Getter functions (e.g., `get_chp_parameters()`, `get_bess_parameters()`) to provide structured parameters to other modules.
+\end{itemize}
+
+\subsection{DES Optimizer (`src/des_optimizer/des_model.py`)}
+This module implements the core DES operational optimization model using Pyomo.
+\begin{itemize}
+    \item \textbf{`build_des_model()`}: Constructs a Pyomo `ConcreteModel`. 
+    \begin{itemize}
+        \item \textit{Sets}: Time steps (e.g., hourly over an optimization horizon).
+        \item \textit{Parameters}: Electricity and heat demand, PV generation factor, CHP parameters (fuel cost, carbon emission factor, efficiency, ramp limits, min/max output), BESS parameters (charge/discharge efficiency, capacity, SOC limits), market electricity prices (buy/sell), grid constraints, and carbon price.
+        \item \textit{Variables}: Power generation from CHP (electricity and heat), PV; power charged/discharged from BESS; electricity bought/sold from/to the grid; BESS state of charge (SOC); CHP on/off status (binary variable).
+        \item \textit{Constraints}: Electricity balance, heat balance, CHP operational constraints (min/max load, ramp rates, P/H ratio if applicable), BESS operational constraints (SOC limits, charge/discharge power limits, energy balance), grid import/export limits.
+        \item \textit{Objective Function}: Minimize total operational cost, defined as: Fuel Cost (CHP) + Grid Electricity Purchase Cost - Grid Electricity Sale Revenue + Carbon Emission Cost.
+    \end{itemize}
+    \item \textbf{`solve_des_model()`}: Solves the Pyomo model using a specified MILP solver (e.g., CBC).
+    \item \textbf{`extract_results()`}: Parses the solver's results into a Pandas DataFrame for detailed time-series dispatch and a dictionary for summary metrics.
+\end{itemize}
+
+\subsection{Carbon Pricer (`src/carbon_pricer/carbon_price_models.py`)}
+This module generates carbon price scenarios.
+\begin{itemize}
+    \item \textbf{`generate_synthetic_historical_prices()`}: Creates a synthetic daily GBM price series to simulate historical carbon prices.
+    \item \textbf{`fit_garch_model()`}: Fits a GARCH(1,1) model to the returns of the historical price series to capture volatility clustering.
+    \item \textbf{`generate_price_scenarios_gbm()`}: Generates multiple carbon price paths using Geometric Brownian Motion with specified drift and volatility.
+    \item \textbf{`generate_price_scenarios_garch()`}: Generates multiple carbon price paths using simulations from the fitted GARCH model.
+\end{itemize}
+
+\subsection{Financial Option Pricer (`src/financial_option_pricer/option_pricer.py`)}
+Prices European financial carbon options.
+\begin{itemize}
+    \item \textbf{`black_scholes_european_call()`} and \textbf{`black_scholes_european_put()`}: Implement the Black-Scholes formulas for European call and put options.
+    \item \textbf{`price_european_option()`}: A wrapper function that utilizes the Black-Scholes functions, taking inputs like spot price, strike price, time to maturity, risk-free rate, and volatility. For the case study, volatility is often assumed or derived from the carbon price models.
+\end{itemize}
+
+\subsection{Real Option Analyzer (`src/real_option_analyzer/roa_model.py`)}
+Evaluates strategic investments using ROA, specifically for a CCS deferral option.
+\begin{itemize}
+    \item \textbf{`value_american_call_on_binomial_lattice()`}: Values an American-style call option (representing the option to invest/defer) using a binomial lattice. It takes callback functions for calculating the underlying asset's value (NPV of the project) and the investment cost at each node of the lattice.
+    \item \textbf{`ccs_project_npv_at_node()`}: A callback function that calculates the NPV of the CCS project's future cash flows at a given carbon price at a lattice node. This NPV is typically based on avoided carbon costs or revenues from CCS operation, simplified for the project's lifetime.
+    \item \textbf{`ccs_investment_cost_func()`}: A callback function that returns the investment cost for the CCS project.
+\end{itemize}
+
+\subsection{Decision Controller (`src/decision_controller/decision_logic.py`)}
+This module contains placeholder logic for operational and strategic decisions.
+\begin{itemize}
+    \item \textbf{`make_operational_hedging_decision()`}: Intended to decide on purchasing carbon options for hedging. In the current implementation, it returns a dummy decision.
+    \item \textbf{`make_strategic_investment_decision()`}: Intended to make CCS investment decisions based on ROA. Currently returns a dummy decision.
+\end{itemize}
+Full implementation of these decision functions would require more complex models (e.g., stochastic programming, bi-level optimization), which are beyond the scope of the current phase but identified as future work.
+
+\subsection{Results Analyzer (`src/results_analyzer/analysis.py`)}
+Provides functions for processing and visualizing results.
+\begin{itemize}
+    \item Plotting functions for DES dispatch, carbon price scenarios.
+    \item Display functions for option prices and ROA summaries.
+\end{itemize}
+
+\subsection{Orchestration Script (`run_case_study.py`)}
+Located in the root directory, this script orchestrates the execution of the entire case study. It imports functions from all modules and sequentially performs:
+\begin{enumerate}
+    \item Loading global parameters and preparing DES operational data.
+    \item Running DES optimization with a baseline carbon price.
+    \item Generating carbon price scenarios.
+    \item Pricing financial carbon options.
+    \item Performing ROA for the CCS investment.
+    \item Calling placeholder decision-making functions.
+    \item Consolidating and displaying/plotting key results using `analysis.py`.
+\end{enumerate}
+This modular structure, with a central orchestration script, allows for systematic testing and analysis of the integrated system's behavior under different assumptions and data inputs.
+
+
