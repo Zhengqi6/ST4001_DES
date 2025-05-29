@@ -81,7 +81,7 @@ def make_operational_hedging_decision(des_summary, priced_options, carbon_price_
 
         option_cost_per_ton = option.get('price', float('inf'))
         strike_price = option.get('strike_price')
-        option_label = option.get('label', 'Unknown Option')
+        option_label = option.get('name', 'Unknown Option')
 
         if strike_price is None:
             print(f"Decision Controller: Skipping option {option_label} due to missing strike price.")

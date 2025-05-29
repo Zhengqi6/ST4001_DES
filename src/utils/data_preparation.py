@@ -33,7 +33,7 @@ CCS_MAX_DEFERRAL_YEARS = 3
 
 # Global Simulation Parameters (Centralized)
 DES_OPTIMIZATION_HORIZON_HOURS = 24 * 7 # E.g., 7 days
-NUM_CARBON_PRICE_SCENARIOS = 10
+NUM_CARBON_PRICE_SCENARIOS = 30
 CARBON_SCENARIO_HORIZON_DAYS = 90
 CARBON_PRICE_GBM_DRIFT = 0.08  # Annual drift for GBM
 # CARBON_PRICE_VOLATILITY_ANNUAL is a scenario parameter, but a default could be here if needed
@@ -153,14 +153,22 @@ def get_market_parameters(baseline_carbon_price=None):
     }
 
 def get_financial_option_specs():
-    return [
-        {'strike_price': 180, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'label': 'Call_180_1M'},
-        {'strike_price': 200, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'label': 'Call_200_1M'},
-        {'strike_price': 220, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'label': 'Call_220_1M'},
-        {'strike_price': 180, 'time_to_maturity_years': 3/12, 'option_type': 'call', 'label': 'Call_180_3M'},
-        {'strike_price': 200, 'time_to_maturity_years': 3/12, 'option_type': 'call', 'label': 'Call_200_3M'},
-        {'strike_price': 220, 'time_to_maturity_years': 3/12, 'option_type': 'call', 'label': 'Call_220_3M'},
+    """
+    Generates a list of financial option product configurations.
+    Each product is defined by its type (Call/Put), strike price, and maturity.
+    Example: {'type': 'Call', 'strike_cny_ton': 180, 'maturity_months': 1, 'name': 'Call_180_1M'}
+    """
+    option_specs = [
+        # 1-Month Maturity Options
+        {"option_type": "Call", "strike_price": 280, "time_to_maturity_years": 1/12, "name": "Call_280_1M"},
+        {"option_type": "Call", "strike_price": 300, "time_to_maturity_years": 1/12, "name": "Call_300_1M"},
+        {"option_type": "Call", "strike_price": 330, "time_to_maturity_years": 1/12, "name": "Call_330_1M"},
+        # 3-Month Maturity Options
+        {"option_type": "Call", "strike_price": 280, "time_to_maturity_years": 3/12, "name": "Call_280_3M"},
+        {"option_type": "Call", "strike_price": 300, "time_to_maturity_years": 3/12, "name": "Call_300_3M"},
+        {"option_type": "Call", "strike_price": 330, "time_to_maturity_years": 3/12, "name": "Call_330_3M"},
     ]
+    return option_specs
 
 def get_roa_ccs_project_parameters():
     # Parameters for the CCS addition Real Option Analysis
@@ -193,7 +201,10 @@ def get_simulation_parameters():
         'roa_lattice_steps': ROA_LATTICE_STEPS,
         'risk_aversion_factor': RISK_AVERSION_FACTOR,
         'npv_hurdle_rate': NPV_HURDLE_RATE,
-        'grid_max_import_export_kw': GRID_MAX_IMPORT_EXPORT_KW
+        'grid_max_import_export_kw': GRID_MAX_IMPORT_EXPORT_KW,
+        # New CVaR related parameters for DES model objective
+        'cvar_alpha_level': 0.90, # Changed from 0.95 to 0.90
+        'lambda_cvar_weight': 10.0  # Keep lambda at 10.0
         # Note: 'carbon_price_gbm_volatility' is scenario-specific in run_case_study.py
         # 'operational_simulation_days' was an old key, replaced by des_optimization_horizon_hours
     }

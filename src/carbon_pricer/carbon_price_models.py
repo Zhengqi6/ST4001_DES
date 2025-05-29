@@ -152,6 +152,34 @@ def generate_price_scenarios_garch(garch_fit, initial_price, horizon_days, num_s
         print(f"Error generating GARCH scenarios: {e}")
         return None
 
+def generate_price_scenarios_jump_diffusion(initial_price, drift, volatility, jump_intensity, jump_mean, jump_std, horizon_days, num_scenarios, start_datetime=None):
+    """
+    Generates carbon price paths using a Merton Jump-Diffusion Model (placeholder).
+    Actual implementation would require more sophisticated handling of jump processes.
+    """
+    print(f"Warning: generate_price_scenarios_jump_diffusion is a placeholder and currently falls back to GBM.")
+    # Placeholder: For now, falls back to GBM for structure. 
+    # A full implementation would discretize the jump-diffusion process:
+    # dS/S = (mu - lambda*kappa)dt + sigma*dW_t + dJ_t
+    # where dJ_t is a compound Poisson process. kappa is E[Y-1] where Y is jump size.
+    # For simplicity, the GBM function is called here. Replace with actual jump-diffusion logic.
+    return generate_price_scenarios_gbm(initial_price, drift, volatility, horizon_days, num_scenarios, start_datetime)
+
+def generate_price_scenarios_regime_switching(initial_price, params_regime1, params_regime2, transition_matrix, horizon_days, num_scenarios, start_datetime=None):
+    """
+    Generates carbon price paths using a Regime-Switching Model (placeholder).
+    Actual implementation would involve simulating state transitions and regime-specific dynamics.
+    params_regime1/2 should be dicts like {'drift': ..., 'volatility': ...}
+    transition_matrix is a 2x2 np.array for probabilities P_ij.
+    """
+    print(f"Warning: generate_price_scenarios_regime_switching is a placeholder and currently falls back to GBM using regime1 params.")
+    # Placeholder: For now, falls back to GBM using parameters from the first regime for structure.
+    # A full implementation would:
+    # 1. Simulate the state (regime) sequence using the transition_matrix.
+    # 2. For each time step, apply the drift and volatility of the current regime.
+    # This is a simplified fallback.
+    return generate_price_scenarios_gbm(initial_price, params_regime1.get('drift', 0.02), params_regime1.get('volatility', 0.2), horizon_days, num_scenarios, start_datetime)
+
 if __name__ == '__main__':
     # Demo for GBM
     print("Generating GBM scenarios...")
@@ -213,6 +241,43 @@ if __name__ == '__main__':
             print("Failed to fit GARCH model. Skipping GARCH scenario generation.")
     else:
         print("Historical prices are empty. Skipping GARCH.")
+
+    # Demo for Jump-Diffusion (Placeholder)
+    print("\nGenerating Jump-Diffusion scenarios (Placeholder)...")
+    jump_diffusion_scenarios = generate_price_scenarios_jump_diffusion(
+        initial_price=initial_carbon_price,
+        drift=annual_drift,
+        volatility=annual_volatility,
+        jump_intensity=0.1, # Example: average 0.1 jumps per year
+        jump_mean=0.0,    # Example: mean jump size (log terms)
+        jump_std=0.15,    # Example: std dev of jump size (log terms)
+        horizon_days=days_horizon,
+        num_scenarios=n_scenarios,
+        start_datetime=demo_start_time
+    )
+    if jump_diffusion_scenarios is not None:
+        print("Jump-Diffusion Scenarios Head (Placeholder Fallback to GBM):")
+        print(jump_diffusion_scenarios.head())
+
+    # Demo for Regime-Switching (Placeholder)
+    print("\nGenerating Regime-Switching scenarios (Placeholder)...")
+    regime1_params = {'drift': 0.01, 'volatility': 0.10}
+    regime2_params = {'drift': 0.05, 'volatility': 0.30}
+    # P_ij = probability of switching from i to j. Rows sum to 1.
+    # P = [[P_11, P_12], [P_21, P_22]]
+    trans_matrix = np.array([[0.95, 0.05], [0.03, 0.97]]) 
+    regime_switching_scenarios = generate_price_scenarios_regime_switching(
+        initial_price=initial_carbon_price,
+        params_regime1=regime1_params,
+        params_regime2=regime2_params,
+        transition_matrix=trans_matrix,
+        horizon_days=days_horizon,
+        num_scenarios=n_scenarios,
+        start_datetime=demo_start_time
+    )
+    if regime_switching_scenarios is not None:
+        print("Regime-Switching Scenarios Head (Placeholder Fallback to GBM with Regime1 Params):")
+        print(regime_switching_scenarios.head())
 
     # Example of how it might be used in the main script:
     # model_type_to_use = "GARCH" # or "GBM"

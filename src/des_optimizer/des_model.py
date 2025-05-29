@@ -1,7 +1,8 @@
-from pyomo.environ import ConcreteModel, Set, Param, Var, Constraint, Objective, SolverFactory, NonNegativeReals, Reals, Binary, Expression
+from pyomo.environ import ConcreteModel, Set, Param, Var, Constraint, Objective, SolverFactory, NonNegativeReals, Reals, Binary, Expression, ConstraintList
 import pandas as pd
 import numpy as np
 import pyomo.environ as pyo
+import logging
 
 def build_des_model(data_inputs):
     """
@@ -36,7 +37,7 @@ def build_des_model(data_inputs):
     # --- SETS ---
     model.T = Set(initialize=data_inputs['time_horizon'], ordered=True)
     model.S = Set(initialize=data_inputs['scenarios'], ordered=True) # Scenarios for carbon price
-    model.OPT = Set(initialize=data_inputs['option_types'], ordered=True) # Types of financial options
+    model.OPT = Set(initialize=data_inputs['option_list'], ordered=True) # Types of financial options
 
     # --- PARAMETERS ---
     # Demand (assumed deterministic for now, can be made scenario-dependent if needed)
@@ -87,6 +88,9 @@ def build_des_model(data_inputs):
     # For now, assume payoff is for the whole period for scenario s.
     model.p_option_period_payoff_cny_contract = Param(model.OPT, model.S, initialize=data_inputs['option_payoffs_cny_contract'])
 
+    # New Parameters for CVaR
+    model.p_cvar_alpha = Param(initialize=data_inputs.get('cvar_alpha_level', 0.95), within=Reals) # CVaR confidence level
+    model.p_lambda_cvar = Param(initialize=data_inputs.get('lambda_cvar_weight', 0.0), within=NonNegativeReals) # Weight for CVaR in objective
 
     # --- VARIABLES ---
     # First-stage variables (Option Purchase) - decided before scenario realization
@@ -111,6 +115,10 @@ def build_des_model(data_inputs):
     model.v_grid_import_e = Var(model.S, model.T, domain=NonNegativeReals) 
     model.v_grid_export_e = Var(model.S, model.T, domain=NonNegativeReals) 
 
+    # New Variables for CVaR calculation
+    model.v_var_total_cost = Var(domain=Reals) # Value at Risk for total cost
+    model.v_eta_total_cost_scen = Var(model.S, domain=NonNegativeReals) # Cost exceeding VaR for each scenario
+
     # --- CONSTRAINTS ---
     # Constraints now need to be indexed by scenario S as well
 
@@ -124,18 +132,31 @@ def build_des_model(data_inputs):
         return m.v_chp_gen_e[s,t] <= m.p_chp_cap_e_kw * m.v_chp_on[s,t]
     model.c_chp_max_elec_gen = Constraint(model.S, model.T, rule=chp_max_elec_gen_rule)
 
-    def chp_heat_production_rule(m, s, t):
+    # Revised CHP Heat Production Logic
+    # Constraint 1: Enforce E/H ratio if p_chp_e_to_h_ratio is defined
+    def chp_e_h_ratio_rule(m, s, t):
         if m.p_chp_e_to_h_ratio > 0:
-            return m.v_chp_gen_h[s,t] == m.v_chp_gen_e[s,t] / m.p_chp_e_to_h_ratio
-        elif m.p_chp_cap_h_kwth > 0: 
-             return m.v_chp_gen_h[s,t] <= m.p_chp_cap_h_kwth * m.v_chp_on[s,t]
-        else: 
-            return m.v_chp_gen_h[s,t] == 0
-    model.c_chp_heat_production = Constraint(model.S, model.T, rule=chp_heat_production_rule)
-    
+            # Assumes p_chp_e_to_h_ratio is E_gen / H_gen
+            return m.v_chp_gen_h[s,t] * m.p_chp_e_to_h_ratio == m.v_chp_gen_e[s,t]
+        else:
+            return Constraint.Skip # No fixed ratio to enforce
+    model.c_chp_e_h_ratio = Constraint(model.S, model.T, rule=chp_e_h_ratio_rule)
+
+    # Constraint 2: Enforce maximum heat generation capacity based on v_chp_on
+    def chp_max_heat_gen_rule(m, s, t):
+        if m.p_chp_cap_h_kwth > 0:
+            return m.v_chp_gen_h[s,t] <= m.p_chp_cap_h_kwth * m.v_chp_on[s,t]
+        else:
+            # If no heat capacity defined, heat generation should be zero (unless defined by ratio and E gen)
+            # If ratio is also zero, then this path means H must be 0.
+            if not (m.p_chp_e_to_h_ratio > 0):
+                 return m.v_chp_gen_h[s,t] == 0
+            return Constraint.Skip # Heat is determined by E/H ratio if H_cap is 0 but E/H ratio exists
+    model.c_chp_max_heat_gen = Constraint(model.S, model.T, rule=chp_max_heat_gen_rule)
+
     def chp_min_elec_gen_rule(m, s, t):
         return m.v_chp_gen_e[s,t] >= 0.1 * m.p_chp_cap_e_kw * m.v_chp_on[s,t] 
-    # model.c_chp_min_elec_gen = Constraint(model.S, model.T, rule=chp_min_elec_gen_rule)
+    model.c_chp_min_elec_gen = Constraint(model.S, model.T, rule=chp_min_elec_gen_rule)
 
     # BESS Operation
     def bess_soc_rule(m, s, t):
@@ -185,7 +206,7 @@ def build_des_model(data_inputs):
     model.c_electricity_balance = Constraint(model.S, model.T, rule=electricity_balance_rule)
 
     def heat_balance_rule(m, s, t):
-        return m.v_chp_gen_h[s,t] >= m.p_heat_demand[t] 
+        return m.v_chp_gen_h[s,t] >= m.p_heat_demand[t]  # Restoring original strict constraint
     model.c_heat_balance = Constraint(model.S, model.T, rule=heat_balance_rule)
 
     # --- Expressions for cost components (per scenario) ---
@@ -221,32 +242,56 @@ def build_des_model(data_inputs):
         return m.e_gross_carbon_cost_scen[s] - m.e_options_total_payoff_scen[s]
     model.e_net_carbon_cost_scen = Expression(model.S, rule=net_carbon_cost_scenario_rule)
 
-    # --- OBJECTIVE FUNCTION --- Expected Cost Minimization
+    # Expression for Total Operational Cost per Scenario (excluding first-stage option purchase costs)
+    def total_operational_cost_scenario_rule(m, s):
+        grid_buy_cost_s = sum(m.v_grid_import_e[s,t] * m.p_grid_price_buy_cny_kwh[t] for t in m.T)
+        grid_sell_revenue_s = sum(m.v_grid_export_e[s,t] * m.p_grid_price_sell_cny_kwh for t in m.T)
+        chp_fuel_cost_s = m.e_chp_fuel_consumption_m3_scen[s] * m.p_gas_price_cny_m3
+        # net_carbon_cost_s is already m.e_net_carbon_cost_scen[s]
+        return grid_buy_cost_s - grid_sell_revenue_s + chp_fuel_cost_s + m.e_net_carbon_cost_scen[s]
+    model.e_total_operational_cost_scen = Expression(model.S, rule=total_operational_cost_scenario_rule)
+
+    # Expression for total first-stage option purchase cost
+    def total_option_purchase_cost_rule(m):
+        return sum(m.v_buy_option_contracts[opt] * m.p_option_premium_cny_contract[opt] for opt in m.OPT)
+    model.e_total_option_purchase_cost = Expression(rule=total_option_purchase_cost_rule)
+
+    # Constraints for CVaR calculation
+    def eta_definition_rule(m, s):
+        # Cost for scenario s INCLUDING first-stage option costs
+        cost_for_cvar_s = m.e_total_operational_cost_scen[s] + m.e_total_option_purchase_cost
+        return m.v_eta_total_cost_scen[s] >= cost_for_cvar_s - m.v_var_total_cost
+    model.c_eta_definition_scen = Constraint(model.S, rule=eta_definition_rule)
+
+    # Expression for CVaR of Total Cost
+    def cvar_total_cost_rule(m):
+        if (1 - m.p_cvar_alpha) <= 1e-6: # Avoid division by zero if alpha is 1 or very close
+            # If alpha is 1, CVaR is effectively the max cost or average of worst-case scenarios,
+            # This formulation might not be robust for alpha=1 directly. Consider specific handling or error.
+            # For simplicity, return a large penalty or just the VaR if lambda is non-zero.
+            # A more robust way for alpha=1 would be to take the max of total_operational_cost_scen.
+            # However, typical CVaR usage has alpha < 1.
+            logging.warning("CVaR alpha is very close to 1, CVaR calculation might be unstable or ill-defined with this formulation.")
+            return m.v_var_total_cost # Fallback, or consider raising an error.
+        return m.v_var_total_cost + (1 / (1 - m.p_cvar_alpha)) * sum(m.p_scenario_prob[s] * m.v_eta_total_cost_scen[s] for s in m.S)
+    model.e_cvar_total_cost = Expression(rule=cvar_total_cost_rule)
+
+    # --- OBJECTIVE FUNCTION --- Minimize (Expected Cost + Lambda * CVaR_Cost)
     def expected_total_cost_rule(m):
-        # First-stage cost (Option Premiums)
-        option_purchase_cost = sum(m.v_buy_option_contracts[opt] * m.p_option_premium_cny_contract[opt] for opt in m.OPT)
+        # First-stage cost (Option Premiums) is now captured by model.e_total_option_purchase_cost
+        # expected_operational_cost is sum(m.p_scenario_prob[s] * m.e_total_operational_cost_scen[s] for s in m.S)
         
-        # Expected second-stage costs (Operational Costs for each scenario)
-        expected_operational_cost = 0
-        for s in m.S:
-            grid_buy_cost_scen = sum(m.v_grid_import_e[s,t] * m.p_grid_price_buy_cny_kwh[t] for t in m.T)
-            grid_sell_revenue_scen = sum(m.v_grid_export_e[s,t] * m.p_grid_price_sell_cny_kwh for t in m.T)
-            chp_fuel_cost_scen = m.e_chp_fuel_consumption_m3_scen[s] * m.p_gas_price_cny_m3
-            
-            # Net carbon cost for the scenario (gross emissions cost - option payoffs)
-            net_carbon_cost_scen = m.e_net_carbon_cost_scen[s]
-            
-            scenario_total_op_cost = grid_buy_cost_scen - grid_sell_revenue_scen + chp_fuel_cost_scen + net_carbon_cost_scen
-            expected_operational_cost += m.p_scenario_prob[s] * scenario_total_op_cost
-            
-        return option_purchase_cost + expected_operational_cost
+        # Total objective
+        return model.e_total_option_purchase_cost + sum(m.p_scenario_prob[s] * m.e_total_operational_cost_scen[s] for s in m.S) + m.p_lambda_cvar * model.e_cvar_total_cost
     
-    model.o_expected_total_cost = Objective(rule=expected_total_cost_rule, sense=1) # 1 for minimize
+    model.objective = Objective(rule=expected_total_cost_rule, sense=pyo.minimize)
 
     return model
 
 def solve_des_model(model, solver_name='cbc', tee=True):
     """Solves the Pyomo model and returns results."""
+    # model.write("debug_des_model.lp", io_options={"symbolic_solver_labels": True})
+    # print("！！！！！！！！ DEBUG: Model written to debug_des_model.lp ！！！！！！！！")
     solver = SolverFactory(solver_name)
     results = solver.solve(model, tee=tee)
     return results, model # Return both solver results and the solved model
@@ -269,48 +314,52 @@ def safe_val(var_component):
 
 def extract_results(model, data_inputs):
     """
-    Extracts key results from the solved model for the (first) scenario.
-    Designed for use with run_case_study.py where DES is run for one effective scenario.
+    Extracts key results from the solved model.
+    For stochastic models, it returns first-stage decisions, expected costs,
+    and dispatch/cost details for the FIRST scenario as a sample.
 
     Args:
         model: The solved Pyomo model.
-        data_inputs (dict): The input data dictionary. Used for context if needed.
+        data_inputs (dict): The input data dictionary.
 
     Returns:
-        pd.DataFrame: DataFrame with detailed dispatch results for the (first) scenario.
-        dict: Dictionary with summary operational results for the (first) scenario.
+        pd.DataFrame: DataFrame with detailed dispatch results for the FIRST scenario.
+        dict: Dictionary with summary operational results (first-stage decisions, expected costs).
     """
     if not model.S:
-        # Should not happen if run_case_study.py provides 's1'
         return pd.DataFrame(), {"error": "No scenarios in model"}
 
-    s_label = next(iter(model.S)) # Get the single scenario label (e.g., 's1')
+    # For dispatch details, pick the first scenario as a representative sample
+    # All scenarios are available in model.S if specific scenario analysis is needed elsewhere
+    s_label_sample = model.S.first() 
+    logging.info(f"Extracting dispatch results for sample scenario: {s_label_sample}")
 
-    # --- Part 1: Create Dispatch DataFrame ---
+    # --- Part 1: Create Dispatch DataFrame (for the sample scenario) ---
     time_periods = list(model.T)
     elec_demand_list = [model.p_elec_demand[t] for t in model.T]
     heat_demand_list = [model.p_heat_demand[t] for t in model.T]
     pv_avail_list = [model.p_pv_avail[t] for t in model.T] 
     
-    pv_gen_list = [safe_val(model.v_pv_gen_e[s_label,t]) for t in model.T]
-    pv_curtail_list = [safe_val(model.v_pv_curtail[s_label,t]) for t in model.T]
-    chp_gen_e_list = [safe_val(model.v_chp_gen_e[s_label,t]) for t in model.T]
-    chp_gen_h_list = [safe_val(model.v_chp_gen_h[s_label,t]) for t in model.T]
-    chp_on_list = [safe_val(model.v_chp_on[s_label,t]) for t in model.T]
-    bess_ch_p_list = [safe_val(model.v_bess_ch_p[s_label,t]) for t in model.T]
-    bess_dis_p_list = [safe_val(model.v_bess_dis_p[s_label,t]) for t in model.T]
-    bess_soc_kwh_list = [safe_val(model.v_bess_soc_kwh[s_label,t]) for t in model.T]
-    grid_import_e_list = [safe_val(model.v_grid_import_e[s_label,t]) for t in model.T]
-    grid_export_e_list = [safe_val(model.v_grid_export_e[s_label,t]) for t in model.T]
+    pv_gen_list = [safe_val(model.v_pv_gen_e[s_label_sample,t]) for t in model.T]
+    pv_curtail_list = [safe_val(model.v_pv_curtail[s_label_sample,t]) for t in model.T]
+    chp_gen_e_list = [safe_val(model.v_chp_gen_e[s_label_sample,t]) for t in model.T]
+    chp_gen_h_list = [safe_val(model.v_chp_gen_h[s_label_sample,t]) for t in model.T]
+    chp_on_list = [safe_val(model.v_chp_on[s_label_sample,t]) for t in model.T]
+    bess_ch_p_list = [safe_val(model.v_bess_ch_p[s_label_sample,t]) for t in model.T]
+    bess_dis_p_list = [safe_val(model.v_bess_dis_p[s_label_sample,t]) for t in model.T]
+    bess_soc_kwh_list = [safe_val(model.v_bess_soc_kwh[s_label_sample,t]) for t in model.T]
+    grid_import_e_list = [safe_val(model.v_grid_import_e[s_label_sample,t]) for t in model.T]
+    grid_export_e_list = [safe_val(model.v_grid_export_e[s_label_sample,t]) for t in model.T]
     
-    carbon_prices_scen_hourly = [model.p_carbon_price_scen_cny_ton[s_label, t] for t in model.T]
+    # Carbon prices for the sample scenario's dispatch
+    carbon_prices_sample_scen_hourly = [model.p_carbon_price_scen_cny_ton[s_label_sample, t] for t in model.T]
 
     dispatch_df_data = {
         'time_step': time_periods,
-        'elec_demand_kw': elec_demand_list,
-        'heat_demand_kwth': heat_demand_list,
-        'pv_available_kw': pv_avail_list,
-        'carbon_price_cny_ton': carbon_prices_scen_hourly,
+        'elec_demand_kw': elec_demand_list, # Deterministic
+        'heat_demand_kwth': heat_demand_list, # Deterministic
+        'pv_available_kw': pv_avail_list, # Deterministic
+        'carbon_price_cny_ton': carbon_prices_sample_scen_hourly, # For sample scenario
         'pv_gen_e_kw': pv_gen_list,
         'pv_curtail_kw': pv_curtail_list,
         'chp_gen_e_kw': chp_gen_e_list,
@@ -324,39 +373,10 @@ def extract_results(model, data_inputs):
     }
     dispatch_df = pd.DataFrame(dispatch_df_data).set_index('time_step')
 
-    # --- Part 2: Create Summary Dictionary ---
+    # --- Part 2: Create Summary Dictionary (First-stage decisions and Expected Values) ---
     summary_dict = {}
-    
-    summary_dict['scenario_label_in_model'] = str(s_label)
-    # Directly use probability from data_inputs for clarity in this single-scenario context
-    if s_label in data_inputs.get('scenario_probabilities', {}):
-        summary_dict['scenario_probability'] = data_inputs['scenario_probabilities'][s_label]
-    else:
-        summary_dict['scenario_probability'] = safe_val(model.p_scenario_prob[s_label]) # Fallback
 
-    grid_buy_cost_scen = sum(grid_import_e_list[t_idx] * model.p_grid_price_buy_cny_kwh[t] for t_idx, t in enumerate(model.T))
-    grid_sell_revenue_scen_corr = sum(grid_export_e_list) * model.p_grid_price_sell_cny_kwh
-
-    chp_fuel_consumption_scen_val = safe_val(model.e_chp_fuel_consumption_m3_scen[s_label])
-    chp_fuel_cost_scen = chp_fuel_consumption_scen_val * model.p_gas_price_cny_m3
-    
-    gross_carbon_cost_scen_val = safe_val(model.e_gross_carbon_cost_scen[s_label])
-    option_payoff_scen_val = safe_val(model.e_options_total_payoff_scen[s_label])
-    net_carbon_cost_scen_val = gross_carbon_cost_scen_val - option_payoff_scen_val
-
-    total_operational_cost_scen = grid_buy_cost_scen - grid_sell_revenue_scen_corr + chp_fuel_cost_scen + net_carbon_cost_scen_val
-
-    summary_dict['total_operational_cost_cny'] = total_operational_cost_scen
-    summary_dict['grid_buy_cost_cny'] = grid_buy_cost_scen
-    summary_dict['grid_sell_revenue_cny'] = grid_sell_revenue_scen_corr
-    summary_dict['chp_fuel_cost_cny'] = chp_fuel_cost_scen
-    summary_dict['chp_fuel_consumption_m3'] = chp_fuel_consumption_scen_val
-    summary_dict['gross_carbon_cost_cny'] = gross_carbon_cost_scen_val
-    summary_dict['option_period_payoff_cny'] = option_payoff_scen_val
-    summary_dict['net_carbon_cost_cny'] = net_carbon_cost_scen_val
-    
-    summary_dict['total_chp_co2_emissions_ton'] = safe_val(model.e_chp_co2_emissions_ton_scen[s_label])
-
+    # First-stage decisions (option purchases)
     optimal_options = {}
     for opt_label in model.OPT:
         optimal_options[str(opt_label)] = safe_val(model.v_buy_option_contracts[opt_label])
@@ -364,24 +384,114 @@ def extract_results(model, data_inputs):
     
     option_purchase_cost_total = sum(safe_val(model.v_buy_option_contracts[opt]) * model.p_option_premium_cny_contract[opt] for opt in model.OPT)
     summary_dict['option_purchase_cost_total_cny'] = option_purchase_cost_total
-    
-    # For single scenario DES, the model objective should effectively be the total operational cost for that scenario
-    # plus any option purchase costs (which are 0 in current DES setup via run_case_study.py)
-    summary_dict['model_objective_expected_total_cost_cny'] = total_operational_cost_scen + option_purchase_cost_total 
-    # summary_dict['model_objective_expected_total_cost_cny'] = safe_val(model.o_expected_total_cost) # Old way
 
-    # Add aggregated physical quantities from dispatch_df
-    summary_dict['total_elec_demand_kwh'] = dispatch_df['elec_demand_kw'].sum() # Assuming 1-hour time steps
-    summary_dict['total_heat_demand_kwth_h'] = dispatch_df['heat_demand_kwth'].sum() # Assuming 1-hour time steps
+    # Overall model objective (Expected Total Cost)
+    summary_dict['model_objective_expected_total_cost_cny'] = safe_val(model.objective)
+    
+    # Expected operational cost (derived from objective and first-stage cost)
+    summary_dict['expected_operational_cost_cny'] = summary_dict['model_objective_expected_total_cost_cny'] - summary_dict['option_purchase_cost_total_cny']
+
+    # Calculate expected values for other key metrics by averaging over scenarios
+    exp_grid_buy_cost = 0
+    exp_grid_sell_revenue = 0
+    exp_chp_fuel_cost = 0
+    exp_chp_fuel_consumption_m3 = 0
+    exp_gross_carbon_cost = 0
+    exp_option_period_payoff = 0 # This is expected payoff from purchased options
+    exp_net_carbon_cost = 0
+    exp_total_chp_co2_emissions_ton = 0
+    
+    # Physical quantities (summed over time for each scenario, then averaged)
+    # These are useful if we want expected physical flows, not just costs
+    exp_total_pv_gen_e_kwh = 0
+    exp_total_pv_curtail_kwh = 0
+    exp_total_chp_gen_e_kwh = 0
+    exp_total_chp_gen_h_kwth_h = 0
+    exp_total_bess_charge_kwh = 0
+    exp_total_bess_discharge_kwh = 0
+    exp_total_grid_import_kwh = 0
+    exp_total_grid_export_kwh = 0
+
+    for s in model.S:
+        prob_s = model.p_scenario_prob[s]
+
+        # Costs for this scenario
+        scen_grid_buy_cost = sum(safe_val(model.v_grid_import_e[s,t]) * model.p_grid_price_buy_cny_kwh[t] for t in model.T)
+        scen_grid_sell_revenue = sum(safe_val(model.v_grid_export_e[s,t]) * model.p_grid_price_sell_cny_kwh for t in model.T) # p_grid_price_sell_cny_kwh is a single param
+        scen_chp_fuel_consumption_m3 = safe_val(model.e_chp_fuel_consumption_m3_scen[s])
+        scen_chp_fuel_cost = scen_chp_fuel_consumption_m3 * model.p_gas_price_cny_m3
+        scen_gross_carbon_cost = safe_val(model.e_gross_carbon_cost_scen[s])
+        scen_option_payoff = safe_val(model.e_options_total_payoff_scen[s]) # Payoff from *purchased* options
+        scen_net_carbon_cost = scen_gross_carbon_cost - scen_option_payoff
+        scen_total_chp_co2_emissions_ton = safe_val(model.e_chp_co2_emissions_ton_scen[s])
+
+        exp_grid_buy_cost += prob_s * scen_grid_buy_cost
+        exp_grid_sell_revenue += prob_s * scen_grid_sell_revenue
+        exp_chp_fuel_cost += prob_s * scen_chp_fuel_cost
+        exp_chp_fuel_consumption_m3 += prob_s * scen_chp_fuel_consumption_m3
+        exp_gross_carbon_cost += prob_s * scen_gross_carbon_cost
+        exp_option_period_payoff += prob_s * scen_option_payoff
+        exp_net_carbon_cost += prob_s * scen_net_carbon_cost
+        exp_total_chp_co2_emissions_ton += prob_s * scen_total_chp_co2_emissions_ton
+        
+        # Summing hourly physical quantities for scenario s, then weighting by probability
+        exp_total_pv_gen_e_kwh += prob_s * sum(safe_val(model.v_pv_gen_e[s,t]) for t in model.T)
+        exp_total_pv_curtail_kwh += prob_s * sum(safe_val(model.v_pv_curtail[s,t]) for t in model.T)
+        exp_total_chp_gen_e_kwh += prob_s * sum(safe_val(model.v_chp_gen_e[s,t]) for t in model.T)
+        exp_total_chp_gen_h_kwth_h += prob_s * sum(safe_val(model.v_chp_gen_h[s,t]) for t in model.T)
+        exp_total_bess_charge_kwh += prob_s * sum(safe_val(model.v_bess_ch_p[s,t]) for t in model.T)
+        exp_total_bess_discharge_kwh += prob_s * sum(safe_val(model.v_bess_dis_p[s,t]) for t in model.T)
+        exp_total_grid_import_kwh += prob_s * sum(safe_val(model.v_grid_import_e[s,t]) for t in model.T)
+        exp_total_grid_export_kwh += prob_s * sum(safe_val(model.v_grid_export_e[s,t]) for t in model.T)
+
+    summary_dict['expected_grid_buy_cost_cny'] = exp_grid_buy_cost
+    summary_dict['expected_grid_sell_revenue_cny'] = exp_grid_sell_revenue
+    summary_dict['expected_chp_fuel_cost_cny'] = exp_chp_fuel_cost
+    summary_dict['expected_chp_fuel_consumption_m3'] = exp_chp_fuel_consumption_m3
+    summary_dict['expected_gross_carbon_cost_cny'] = exp_gross_carbon_cost
+    summary_dict['expected_option_period_payoff_cny'] = exp_option_period_payoff
+    summary_dict['expected_net_carbon_cost_cny'] = exp_net_carbon_cost
+    summary_dict['expected_total_chp_co2_emissions_ton'] = exp_total_chp_co2_emissions_ton
+
+    # Deterministic demands and PV availability (can be summed directly from dispatch_df if needed, or from params)
+    # These are useful for context, already available in dispatch_df or model.p_...
+    summary_dict['total_elec_demand_kwh'] = dispatch_df['elec_demand_kw'].sum() 
+    summary_dict['total_heat_demand_kwth_h'] = dispatch_df['heat_demand_kwth'].sum()
     summary_dict['total_pv_available_kwh'] = dispatch_df['pv_available_kw'].sum()
-    summary_dict['total_pv_gen_e_kwh'] = dispatch_df['pv_gen_e_kw'].sum()
-    summary_dict['total_pv_curtail_kwh'] = dispatch_df['pv_curtail_kw'].sum()
-    summary_dict['total_chp_gen_e_kwh'] = dispatch_df['chp_gen_e_kw'].sum()
-    summary_dict['total_chp_gen_h_kwth_h'] = dispatch_df['chp_gen_h_kwth'].sum()
-    summary_dict['total_bess_charge_kwh'] = dispatch_df['bess_charge_kw'].sum()
-    summary_dict['total_bess_discharge_kwh'] = dispatch_df['bess_discharge_kw'].sum()
-    summary_dict['total_grid_import_kwh'] = dispatch_df['grid_import_kw'].sum()
-    summary_dict['total_grid_export_kwh'] = dispatch_df['grid_export_kw'].sum()
+    
+    # Add expected physical quantities (these are new)
+    summary_dict['expected_total_pv_gen_e_kwh'] = exp_total_pv_gen_e_kwh
+    summary_dict['expected_total_pv_curtail_kwh'] = exp_total_pv_curtail_kwh
+    summary_dict['expected_total_chp_gen_e_kwh'] = exp_total_chp_gen_e_kwh
+    summary_dict['expected_total_chp_gen_h_kwth_h'] = exp_total_chp_gen_h_kwth_h
+    summary_dict['expected_total_bess_charge_kwh'] = exp_total_bess_charge_kwh
+    summary_dict['expected_total_bess_discharge_kwh'] = exp_total_bess_discharge_kwh
+    summary_dict['expected_total_grid_import_kwh'] = exp_total_grid_import_kwh
+    summary_dict['expected_total_grid_export_kwh'] = exp_total_grid_export_kwh
+    
+    # For compatibility with existing run_case_study structure that might look for these specific keys:
+    # We fill them with expected values.
+    summary_dict['total_operational_cost_cny'] = summary_dict['expected_operational_cost_cny']
+    summary_dict['grid_buy_cost_cny'] = summary_dict['expected_grid_buy_cost_cny']
+    summary_dict['grid_sell_revenue_cny'] = summary_dict['expected_grid_sell_revenue_cny']
+    summary_dict['chp_fuel_cost_cny'] = summary_dict['expected_chp_fuel_cost_cny']
+    summary_dict['gross_carbon_cost_cny'] = summary_dict['expected_gross_carbon_cost_cny']
+    summary_dict['option_period_payoff_cny'] = summary_dict['expected_option_period_payoff_cny'] # Payoff from purchased options
+    summary_dict['net_carbon_cost_cny'] = summary_dict['expected_net_carbon_cost_cny']
+    summary_dict['total_chp_co2_emissions_ton'] = summary_dict['expected_total_chp_co2_emissions_ton']
+    # scenario_probability and scenario_label_in_model are no longer single values in summary_dict.
+    # If needed by run_case_study, these would need to be handled differently, e.g. by pickling full scenario results.
+
+    # Extract VaR and CVaR values if they exist on the model (i.e., lambda_cvar_weight was > 0 or they were defined)
+    if hasattr(model, 'v_var_total_cost') and hasattr(model, 'e_cvar_total_cost'):
+        summary_dict['value_at_risk_total_cost_cny'] = safe_val(model.v_var_total_cost)
+        summary_dict['conditional_value_at_risk_total_cost_cny'] = safe_val(model.e_cvar_total_cost)
+    else:
+        summary_dict['value_at_risk_total_cost_cny'] = None
+        summary_dict['conditional_value_at_risk_total_cost_cny'] = None
+
+    # Costs for the first sample scenario (or an average/representative scenario)
+    s_sample = model.S.first() # Use the first scenario as a sample
 
     return dispatch_df, summary_dict
 
