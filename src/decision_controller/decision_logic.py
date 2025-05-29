@@ -18,103 +18,202 @@ def calculate_cvar(costs_series, alpha_level):
     cvar = costs_series[costs_series >= var].mean()
     return cvar
 
-def make_operational_hedging_decision(des_summary, priced_options, carbon_price_scenarios_df, operational_params):
+def make_operational_hedging_decision(des_summary, priced_instruments, carbon_price_scenarios_df, operational_params):
     """
-    Makes a decision on operational hedging using financial carbon options.
+    Makes a decision on operational hedging using financial carbon instruments (options, futures).
 
     Args:
-        des_summary (dict): Summary of DES operation from baseline run.
-                            Expected to contain 'total_chp_co2_ton'.
-        priced_options (list): List of dictionaries, each representing a priced option.
-                               Each option dict should have 'label', 'price' (per ton), 
-                               'strike_price', 'option_type' (e.g., 'call').
+        des_summary (dict): Summary of DES operation.
+        priced_instruments (list): List of dictionaries, each representing a priced instrument.
+                                 Option dict: {'instrument_type': 'option', 'name', 'price' (premium), 'strike_price', 'option_type'}.
+                                 Futures dict: {'instrument_type': 'futures', 'name', 'price' (futures_price), 'premium' (0.0)}.
         carbon_price_scenarios_df (pd.DataFrame): DataFrame of carbon price scenarios.
-                                                  Index=time, columns=scenarios.
-                                                  Assumes prices are daily.
         operational_params (dict): Parameters for decision logic.
-                                   Expected: 
-                                   'cvar_alpha_level' (float, e.g., 0.95 for 95% CVaR),
-                                   'co2_tons_to_hedge_from_des' (str key, e.g. 'total_chp_co2_ton', to get CO2 tons from des_summary),
-                                   'hedge_decision_threshold_cvar_reduction_pct' (float, e.g., 0.05 for 5% reduction).
 
     Returns:
         tuple: (str: decision_action, dict: decision_details)
     """
     print("Decision Controller: Making operational hedging decision...")
-    if des_summary is None or not priced_options or carbon_price_scenarios_df is None or carbon_price_scenarios_df.empty:
-        print("Decision Controller: Insufficient data for hedging decision (DES summary, options, or scenarios missing).")
+    if des_summary is None or not priced_instruments or carbon_price_scenarios_df is None or carbon_price_scenarios_df.empty:
+        print("Decision Controller: Insufficient data for hedging decision (DES summary, instruments, or scenarios missing).")
         return ("NoHedge", {"reason": "Insufficient input data."})
 
     alpha_level = operational_params.get('cvar_alpha_level', 0.95)
     co2_tons_key = operational_params.get('co2_tons_to_hedge_from_des', 'total_chp_co2_ton')
     co2_tons_to_hedge = des_summary.get(co2_tons_key, 0)
-    min_cvar_reduction_pct = operational_params.get('hedge_decision_threshold_cvar_reduction_pct', 0.05) 
+    min_cvar_reduction_pct_threshold = operational_params.get('hedge_decision_threshold_cvar_reduction_pct', 0.05) 
 
     if co2_tons_to_hedge <= 0:
         print(f"Decision Controller: No CO2 emissions ({co2_tons_key}={co2_tons_to_hedge}) to hedge.")
         return ("NoHedge", {"reason": f"No CO2 emissions ({co2_tons_key}={co2_tons_to_hedge}) to hedge."})
 
-    if carbon_price_scenarios_df.iloc[-1].isnull().all():
-        print("Decision Controller: Carbon price scenarios contain all NaNs at the final step.")
-        return ("NoHedge", {"reason": "Invalid carbon price scenarios (all NaNs at maturity)."})
-        
-    future_carbon_prices = carbon_price_scenarios_df.iloc[-1].dropna()
-    if future_carbon_prices.empty:
-        print("Decision Controller: No valid future carbon prices after dropping NaNs.")
-        return ("NoHedge", {"reason": "No valid future carbon prices from scenarios."})
+    # Determine a relevant horizon for unhedged cost calculation.
+    # This could be the maximum maturity of options being considered or a fixed operational horizon.
+    # For now, let's use the full horizon of the provided carbon_price_scenarios_df for unhedged CVaR.
+    # This assumes we are interested in the risk over the full scenario period if unhedged.
+    horizon_days_for_unhedged_eval = carbon_price_scenarios_df.shape[0]
+    
+    # Use carbon prices at the *end of this evaluation horizon* for unhedged cost scenarios.
+    # This is consistent with evaluating exposure at the end of the period.
+    # If using average price for unhedged, this would need to change.
+    unhedged_carbon_prices_at_eval_horizon = carbon_price_scenarios_df.iloc[horizon_days_for_unhedged_eval - 1].dropna()
 
-    unhedged_total_carbon_costs = co2_tons_to_hedge * future_carbon_prices
-    cvar_unhedged = calculate_cvar(unhedged_total_carbon_costs, alpha_level)
-    print(f"Decision Controller: Unhedged CO2 Cost CVaR ({alpha_level*100:.0f}%): {cvar_unhedged:.2f} CNY for {co2_tons_to_hedge:.2f} tons")
+    if unhedged_carbon_prices_at_eval_horizon.empty:
+        print(f"Decision Controller: No valid future carbon prices at evaluation horizon (day {horizon_days_for_unhedged_eval}) for unhedged CVaR calculation.")
+        return ("NoHedge", {"reason": "No valid future carbon prices for unhedged CVaR decision."})
+
+    unhedged_total_carbon_costs_scenario = co2_tons_to_hedge * unhedged_carbon_prices_at_eval_horizon
+    cvar_unhedged = calculate_cvar(unhedged_total_carbon_costs_scenario, alpha_level)
+    print(f"Decision Controller: Unhedged CO2 Cost CVaR ({alpha_level*100:.0f}%) over {horizon_days_for_unhedged_eval} days: {cvar_unhedged:.2f} CNY for {co2_tons_to_hedge:.2f} tons")
 
     if np.isnan(cvar_unhedged):
         print("Decision Controller: Could not calculate unhedged CVaR.")
         return ("NoHedge", {"reason": "Could not calculate unhedged CVaR."})
 
-    best_hedge_cvar = cvar_unhedged
-    best_option_details = None
-    recommended_strategy = "NoHedge"
+    best_hedge_metric = cvar_unhedged # Can be CVaR for options or deterministic cost for futures
+    best_instrument_details = None
+    recommended_strategy_action = "NoHedge"
 
-    for option in priced_options:
-        if option.get('option_type', '').lower() != 'call':
+    for instrument in priced_instruments:
+        instrument_type = instrument.get('instrument_type')
+        instrument_name = instrument.get('name', 'Unknown Instrument')
+        instrument_price = instrument.get('price') # This is premium for options, futures price for futures
+
+        if instrument_price is None:
+            print(f"Decision Controller: Skipping instrument {instrument_name} due to missing price/premium.")
             continue
 
-        option_cost_per_ton = option.get('price', float('inf'))
-        strike_price = option.get('strike_price')
-        option_label = option.get('name', 'Unknown Option')
+        current_instrument_metric = float('inf')
+        current_instrument_hedged_costs_scenario = None
 
-        if strike_price is None:
-            print(f"Decision Controller: Skipping option {option_label} due to missing strike price.")
-            continue
+        # Determine the relevant carbon prices for this specific instrument based on its maturity
+        instrument_maturity_years = instrument.get('time_to_maturity_years')
+        payoff_carbon_prices_for_instrument = None
 
-        hedged_total_carbon_costs_option = co2_tons_to_hedge * (np.minimum(future_carbon_prices, strike_price) + option_cost_per_ton)
-        cvar_hedged_option = calculate_cvar(hedged_total_carbon_costs_option, alpha_level)
-        print(f"Decision Controller: Option '{option_label}' (Strike: {strike_price:.2f}, Price: {option_cost_per_ton:.2f}) - Hedged CVaR: {cvar_hedged_option:.2f} CNY")
+        if instrument_maturity_years is not None:
+            maturity_days = int(round(instrument_maturity_years * 365)) # Approx days
+            # Ensure maturity_days is within the scenario horizon and at least 1 day for slicing
+            maturity_days = min(max(1, maturity_days), carbon_price_scenarios_df.shape[0])
+            
+            # For payoff calculation (options, swaps potentially), use average price up to maturity for each scenario
+            # For cost calculation of a locked-in price (futures), the specific day's price might be less relevant
+            # than the locked-in price itself.
+            # The current logic for futures/swaps uses the locked price directly, which is fine.
+            # For options and collars, we need the spot price distribution at THEIR maturity.
 
-        if not np.isnan(cvar_hedged_option) and cvar_hedged_option < best_hedge_cvar:
-            best_hedge_cvar = cvar_hedged_option
-            recommended_strategy = "HedgeWithFinancialOption"
-            best_option_details = {
-                'option_label': option_label,
-                'strike_price': strike_price,
-                'option_price_per_ton': option_cost_per_ton,
-                'quantity_hedged_tons': co2_tons_to_hedge,
-                'achieved_cvar': best_hedge_cvar,
-                'unhedged_cvar': cvar_unhedged,
-                'cvar_reduction_cny': cvar_unhedged - best_hedge_cvar,
-                'cvar_reduction_pct': (cvar_unhedged - best_hedge_cvar) / cvar_unhedged if cvar_unhedged > 0 else 0
-            }
-
-    if recommended_strategy == "HedgeWithFinancialOption" and best_option_details:
-        if best_option_details['cvar_reduction_pct'] >= min_cvar_reduction_pct:
-            print(f"Decision Controller: Recommended Hedge: {best_option_details['option_label']} reduces CVaR by {best_option_details['cvar_reduction_pct']:.2%}.")
-            return recommended_strategy, best_option_details
+            # We will use the spot price on the day of maturity for options/collars.
+            # This is more standard than average price for European option payoff at maturity.
+            payoff_carbon_prices_for_instrument = carbon_price_scenarios_df.iloc[maturity_days - 1].dropna()
         else:
-            print(f"Decision Controller: Best option {best_option_details['option_label']} CVaR reduction ({best_option_details['cvar_reduction_pct']:.2%}) is below threshold ({min_cvar_reduction_pct:.2%}). No hedge recommended.")
-            return "NoHedge", {"reason": f"Best option {best_option_details['option_label']} CVaR reduction below threshold.", "details": best_option_details}
+            # Default to overall evaluation horizon if instrument has no specific maturity (e.g., some abstract instrument)
+            # Or if maturity is not relevant (like for a future that locks in a price regardless of spot at intermediate times)
+            payoff_carbon_prices_for_instrument = unhedged_carbon_prices_at_eval_horizon # Fallback, but should be handled by type
+
+        if payoff_carbon_prices_for_instrument.empty and instrument_type in ['option', 'collar_strategy']:
+            print(f"Decision Controller: No valid carbon prices at instrument's maturity (approx day {maturity_days if instrument_maturity_years else 'N/A'}) for {instrument_name}. Skipping.")
+            continue
+            
+        if instrument_type == 'option':
+            option_type = instrument.get('option_type', '').lower()
+            if option_type != 'call': # Currently only evaluating call options for hedging emissions cost
+                continue
+            
+            strike_price = instrument.get('strike_price')
+            option_premium_per_ton = instrument.get('premium', instrument_price)
+
+            if strike_price is None:
+                print(f"Decision Controller: Skipping option {instrument_name} due to missing strike price.")
+                continue
+            
+            # Cost with call option: Min(Spot_at_maturity, Strike) + Premium
+            # Spot_at_maturity comes from payoff_carbon_prices_for_instrument
+            hedged_spot_price_per_ton = np.minimum(payoff_carbon_prices_for_instrument, strike_price)
+            total_cost_per_ton_scenario = hedged_spot_price_per_ton + option_premium_per_ton
+            current_instrument_hedged_costs_scenario = co2_tons_to_hedge * total_cost_per_ton_scenario
+            current_instrument_metric = calculate_cvar(current_instrument_hedged_costs_scenario, alpha_level)
+            print(f"Decision Controller: Option \'{instrument_name}\' (Maturity: {instrument_maturity_years*12 if instrument_maturity_years else 'N/A'}M, Strike: {strike_price:.2f}, Premium: {option_premium_per_ton:.2f}) - Hedged CVaR: {current_instrument_metric:.2f} CNY")
+        
+        elif instrument_type == 'futures':
+            futures_price_locked = instrument_price # This is F0
+            # Cost with futures is deterministic: Tons * Futures_Price
+            deterministic_cost_with_futures = co2_tons_to_hedge * futures_price_locked
+            current_instrument_metric = deterministic_cost_with_futures
+            # For consistent reporting, use the unhedged_carbon_prices_at_eval_horizon's index for the Series
+            current_instrument_hedged_costs_scenario = pd.Series([deterministic_cost_with_futures] * len(unhedged_carbon_prices_at_eval_horizon), index=unhedged_carbon_prices_at_eval_horizon.index)
+            print(f"Decision Controller: Futures \'{instrument_name}\' (Price: {futures_price_locked:.2f}) - Hedged Deterministic Cost: {current_instrument_metric:.2f} CNY")
+
+        elif instrument_type == 'swap':
+            fixed_swap_rate = instrument.get('fixed_rate', instrument_price)
+            if fixed_swap_rate is None or np.isnan(fixed_swap_rate):
+                print(f"Decision Controller: Skipping swap {instrument_name} due to missing or invalid fixed rate.")
+                continue
+            
+            deterministic_cost_with_swap = co2_tons_to_hedge * fixed_swap_rate
+            current_instrument_metric = deterministic_cost_with_swap
+            current_instrument_hedged_costs_scenario = pd.Series([deterministic_cost_with_swap] * len(unhedged_carbon_prices_at_eval_horizon), index=unhedged_carbon_prices_at_eval_horizon.index)
+            print(f"Decision Controller: Swap \'{instrument_name}\' (Fixed Rate: {fixed_swap_rate:.2f}) - Hedged Deterministic Cost: {current_instrument_metric:.2f} CNY")
+
+        elif instrument_type == 'collar_strategy':
+            put_strike = instrument.get('put_strike_price')
+            call_strike = instrument.get('call_strike_price')
+            collar_net_premium = instrument.get('premium')
+
+            if put_strike is None or call_strike is None or collar_net_premium is None:
+                print(f"Decision Controller: Skipping collar {instrument_name} due to missing strike prices or net premium.")
+                continue
+            
+            # Cost with collar per ton = Net Premium + Effective Price bounded by strikes
+            # Effective price is min(K_call, max(K_put, Spot_at_maturity_for_instrument))
+            # Spot_at_maturity_for_instrument comes from payoff_carbon_prices_for_instrument
+            effective_price_with_collar = np.minimum(call_strike, np.maximum(put_strike, payoff_carbon_prices_for_instrument))
+            cost_per_ton_with_collar = collar_net_premium + effective_price_with_collar
+            current_instrument_hedged_costs_scenario = co2_tons_to_hedge * cost_per_ton_with_collar
+            current_instrument_metric = calculate_cvar(current_instrument_hedged_costs_scenario, alpha_level)
+            print(f"Decision Controller: Collar Strategy \'{instrument_name}\' (Maturity: {instrument_maturity_years*12 if instrument_maturity_years else 'N/A'}M, P:{put_strike:.2f}, C:{call_strike:.2f}, NetPrem:{collar_net_premium:.2f}) - Hedged CVaR: {current_instrument_metric:.2f} CNY")
+
+        else:
+            print(f"Decision Controller: Unknown instrument type '{instrument_type}' for {instrument_name}. Skipping.")
+            continue
+
+        if not np.isnan(current_instrument_metric) and current_instrument_metric < best_hedge_metric:
+            best_hedge_metric = current_instrument_metric
+            recommended_strategy_action = f"HedgeWith{instrument_type.capitalize()}" # e.g., HedgeWithOption, HedgeWithFutures
+            
+            achieved_metric_for_details = best_hedge_metric
+            cvar_reduction_val = cvar_unhedged - achieved_metric_for_details
+            cvar_reduction_pct_val = (cvar_reduction_val / cvar_unhedged) if cvar_unhedged > 0 else 0
+
+            best_instrument_details = {
+                'instrument_name': instrument_name,
+                'instrument_type': instrument_type,
+                'quantity_hedged_tons': co2_tons_to_hedge,
+                'achieved_cost_metric': achieved_metric_for_details, # CVaR for options, Cost for futures
+                'unhedged_cvar': cvar_unhedged,
+                'metric_improvement_cny': cvar_reduction_val,
+                'metric_improvement_pct': cvar_reduction_pct_val
+            }
+            if instrument_type == 'option':
+                best_instrument_details['strike_price'] = strike_price
+                best_instrument_details['premium_per_ton'] = option_premium_per_ton
+            elif instrument_type == 'futures':
+                best_instrument_details['futures_price_locked'] = futures_price_locked
+            elif instrument_type == 'swap':
+                best_instrument_details['fixed_swap_rate'] = fixed_swap_rate
+            elif instrument_type == 'collar_strategy':
+                best_instrument_details['put_strike_price'] = instrument.get('put_strike_price')
+                best_instrument_details['call_strike_price'] = instrument.get('call_strike_price')
+                best_instrument_details['net_premium'] = instrument.get('premium')
     
-    print("Decision Controller: No suitable financial option found to improve CVaR significantly.")
-    return "NoHedge", {"reason": "No suitable option found or CVaR reduction insufficient."}
+    if recommended_strategy_action != "NoHedge" and best_instrument_details:
+        if best_instrument_details['metric_improvement_pct'] >= min_cvar_reduction_pct_threshold:
+            print(f"Decision Controller: Recommended Hedge: {best_instrument_details['instrument_name']} ({best_instrument_details['instrument_type']}) reduces cost metric by {best_instrument_details['metric_improvement_pct']:.2%}.")
+            return recommended_strategy_action, best_instrument_details
+        else:
+            print(f"Decision Controller: Best instrument {best_instrument_details['instrument_name']} metric improvement ({best_instrument_details['metric_improvement_pct']:.2%}) is below threshold ({min_cvar_reduction_pct_threshold:.2%}). No hedge recommended.")
+            return "NoHedge", {"reason": f"Best instrument {best_instrument_details['instrument_name']} metric improvement below threshold.", "details": best_instrument_details}
+    
+    print("Decision Controller: No suitable financial instrument found to improve cost metric significantly.")
+    return "NoHedge", {"reason": "No suitable instrument found or metric improvement insufficient."}
 
 def make_strategic_investment_decision(roa_results_ccs, strategic_params, market_outlook):
     """
@@ -189,17 +288,25 @@ def make_strategic_investment_decision(roa_results_ccs, strategic_params, market
 if __name__ == '__main__':
     print("--- Testing Operational Hedging Decision Logic ---")
     dummy_des_summary = {'total_chp_co2_ton': 100} 
-    dummy_priced_options = [
-        {'label': 'Call_200_1M', 'strike_price': 200, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'price': 5.0},
-        {'label': 'Call_220_1M', 'strike_price': 220, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'price': 2.5},
-        {'label': 'Call_180_1M_Exp', 'strike_price': 180, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'price': 15.0},
+    dummy_priced_instruments_list = [
+        {'instrument_type': 'option', 'name': 'Call_200_1M', 'strike_price': 200, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'price': 5.0, 'premium': 5.0},
+        {'instrument_type': 'option', 'name': 'Call_220_1M', 'strike_price': 220, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'price': 2.5, 'premium': 2.5},
+        {'instrument_type': 'option', 'name': 'Call_180_1M_Exp', 'strike_price': 180, 'time_to_maturity_years': 1/12, 'option_type': 'call', 'price': 15.0, 'premium': 15.0},
+        {'instrument_type': 'futures', 'name': 'Futures_1M', 'time_to_maturity_years': 1/12, 'price': 205.0, 'premium': 0.0}, # Futures price is 205
+        {'instrument_type': 'futures', 'name': 'Futures_3M', 'time_to_maturity_years': 3/12, 'price': 210.0, 'premium': 0.0},  # Futures price is 210
+        {'instrument_type': 'swap', 'name': 'Swap_1M', 'time_to_maturity_years': 1/12, 'price': 208.0, 'fixed_rate': 208.0, 'premium': 0.0}, # Example Swap
+        {'instrument_type': 'swap', 'name': 'Swap_3M_High', 'time_to_maturity_years': 3/12, 'price': 215.0, 'fixed_rate': 215.0, 'premium': 0.0}, # Example Swap
+        # Example Collar Strategy (assuming Put_200_1M and Call_220_1M are priced with premiums that make sense for this test)
+        {'instrument_type': 'collar_strategy', 'name': 'Collar_P200_C220_1M', 
+         'put_strike_price': 200, 'call_strike_price': 220, 'premium': -2.0, # Negative premium means income
+         'put_to_buy_name': 'Put_200_1M_Test', 'call_to_sell_name': 'Call_220_1M_Test'} 
     ]
     np.random.seed(0)
     num_scenarios_test = 1000
     # Ensure future_carbon_prices is a Series for testing calculate_cvar
     future_carbon_prices_test = pd.Series(np.random.normal(loc=210, scale=30, size=num_scenarios_test))
     future_carbon_prices_test[future_carbon_prices_test < 0] = 0 
-    dummy_scenarios_df = pd.DataFrame(future_carbon_prices_test, columns=['scenario_1']) 
+    # dummy_scenarios_df = pd.DataFrame(future_carbon_prices_test, columns=['scenario_1']) # Old test setup
     # For make_operational_hedging_decision, it expects scenarios as columns, and takes the last row.
     # Let's reshape for the test to be similar to what the main script provides (index=time, columns=scenarios)
     dummy_scenarios_df_reshaped = pd.DataFrame(np.random.normal(loc=210, scale=30, size=(10, num_scenarios_test)), 
@@ -211,7 +318,8 @@ if __name__ == '__main__':
         'co2_tons_to_hedge_from_des': 'total_chp_co2_ton', 
         'hedge_decision_threshold_cvar_reduction_pct': 0.02 
     }
-    op_decision, op_details = make_operational_hedging_decision(dummy_des_summary, dummy_priced_options, dummy_scenarios_df_reshaped, dummy_op_params)
+    # op_decision, op_details = make_operational_hedging_decision(dummy_des_summary, dummy_priced_options, dummy_scenarios_df_reshaped, dummy_op_params)
+    op_decision, op_details = make_operational_hedging_decision(dummy_des_summary, dummy_priced_instruments_list, dummy_scenarios_df_reshaped, dummy_op_params)
     print(f"Operational Decision: {op_decision}, Details: {op_details}")
 
     print("\n--- Testing Strategic Investment Decision Logic ---")

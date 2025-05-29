@@ -9,7 +9,8 @@ import logging
 from src.utils.data_preparation import (
     load_electricity_demand, load_heat_demand, load_pv_generation_factor,
     get_chp_parameters, get_bess_parameters, get_market_parameters,
-    get_financial_option_specs, get_roa_ccs_project_parameters, get_simulation_parameters
+    get_financial_instrument_specs, get_roa_ccs_project_parameters, get_simulation_parameters,
+    get_collar_strategy_specs
 )
 from src.des_optimizer.des_model import build_des_model, solve_des_model, extract_results
 from src.carbon_pricer.carbon_price_models import (
@@ -18,6 +19,7 @@ from src.carbon_pricer.carbon_price_models import (
     generate_price_scenarios_jump_diffusion, generate_price_scenarios_regime_switching
 )
 from src.financial_option_pricer.option_pricer import price_european_option
+from src.financial_option_pricer.financial_instruments import get_futures_price, calculate_fair_swap_rate
 from src.real_option_analyzer.roa_model import value_american_call_on_binomial_lattice, ccs_project_npv_at_node, ccs_investment_cost_func
 from src.decision_controller.decision_logic import make_operational_hedging_decision, make_strategic_investment_decision
 from src.results_analyzer.analysis import (
@@ -29,7 +31,7 @@ from src.des_optimizer.des_model_checker import run_all_checks
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-def run_single_experiment(config, base_output_path, global_sim_params, chp_params, bess_params, market_params_func, financial_option_specs, roa_details_func):
+def run_single_experiment(config, base_output_path, global_sim_params, chp_params, bess_params, market_params_func, financial_instrument_specs, roa_details_func):
     """Runs a single experiment configuration."""
     baseline_cp = config["baseline_carbon_price"]
     cp_volatility = config["carbon_price_volatility"]
@@ -54,7 +56,7 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
         },
         "des_operational_summary": None,
         "carbon_price_scenario_summary": None,
-        "financial_options_priced": [],
+        "financial_instruments_evaluated": [],
         "roa_ccs_results": None,
         "operational_hedging_decision": None,
         "strategic_ccs_investment_decision": None,
@@ -124,10 +126,23 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
     try:
         # Robustly extract timestamp for scenario generation
         base_folder_name = os.path.basename(base_output_path)
-        timestamp_part = base_folder_name.split('master_run_')[-1]
-        scenario_gen_start_time = datetime.datetime.strptime(timestamp_part, '%Y%m%d_%H%M%S')
+        # Example: base_folder_name = "master_run_test_models_20250529_174040"
+        # Example: base_folder_name = "master_run_cp300_vol74_20250523_141627"
+
+        parts = base_folder_name.split('_')
+        if len(parts) >= 3: # Check if there are enough parts to form a timestamp
+            # Attempt to form the timestamp from the last two parts
+            timestamp_candidate = parts[-2] + "_" + parts[-1]
+            scenario_gen_start_time = datetime.datetime.strptime(timestamp_candidate, '%Y%m%d_%H%M%S')
+            logging.info(f"Successfully parsed master_run timestamp for scenario generation: {scenario_gen_start_time} from {base_folder_name}")
+        else:
+            # If not enough parts, raise an error to be caught by the except block
+            raise ValueError(f"Folder name format '{base_folder_name}' does not allow easy timestamp extraction from last two parts.")
+            
     except Exception as e:
-        logging.warning(f"Could not parse master_run timestamp from {base_output_path}. Using current time for carbon scenario generation. Error: {e}")
+        # Log detailed error including the parts if available
+        parts_info = locals().get('parts', 'not available')
+        logging.warning(f"Could not parse master_run timestamp from {base_output_path} (parts: {parts_info}). Using current time. Error: {e}")
         scenario_gen_start_time = datetime.datetime.now()
     
     # Add a bit of randomness to microseconds for different experiment runs if they start at the exact same second
@@ -145,7 +160,7 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
         )
         experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM"
     elif carbon_model_to_use == "GARCH":
-        logging.info(f"Attempting GARCH model for carbon price scenarios for {scenario_name}.")
+        logging.info(f"Using GARCH model for carbon price scenarios for {scenario_name}.")
         hist_prices_garch = generate_synthetic_historical_prices(
             days=config.get('garch_hist_days', 500), 
             initial_price=baseline_cp * config.get('garch_hist_initial_price_factor', 0.9), 
@@ -172,53 +187,83 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
                 start_datetime=scenario_gen_start_time
             )
     elif carbon_model_to_use == "JumpDiffusion":
-        logging.info(f"Attempting JumpDiffusion model (placeholder) for {scenario_name}.")
-        # The placeholder function itself calls GBM and logs a warning.
-        # We record that the attempt was made and that it's a placeholder leading to GBM.
-        cp_scenarios_df = generate_price_scenarios_jump_diffusion(
-            initial_price=baseline_cp,
-            drift=config.get('jd_drift', global_sim_params.get('jd_drift', 0.02)),
-            volatility=config.get('jd_volatility', global_sim_params.get('jd_volatility', cp_volatility*0.8)),
-            jump_intensity=config.get('jd_jump_intensity', global_sim_params.get('jd_jump_intensity', 0.1)),
-            jump_mean=config.get('jd_jump_mean', global_sim_params.get('jd_jump_mean', 0.0)),
-            jump_std=config.get('jd_jump_std', global_sim_params.get('jd_jump_std', 0.15)),
-            horizon_days=horizon_days_for_cp_scenarios,
-            num_scenarios=n_scenarios_for_des,
-            start_datetime=scenario_gen_start_time
-        )
-        # Since the placeholder directly returns GBM results, cp_scenarios_df will not be None here.
-        # We mark it as a specific type of GBM usage.
-        experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_via_JumpDiffusion_placeholder"
-        if cp_scenarios_df is None: # Should not happen with current placeholder but good for robustness
-             logging.error(f"JumpDiffusion placeholder unexpectedly returned None for {scenario_name}. THIS IS AN ISSUE.")
-             # Fallback just in case, though the placeholder should handle it.
-             experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_fallback_jumpdiffusion_unexpected_None"
-             cp_scenarios_df = generate_price_scenarios_gbm(
+        logging.info(f"Using actual JumpDiffusion model for {scenario_name}.")
+        try:
+            # The placeholder function generate_price_scenarios_jump_diffusion now internally calls GBM
+            cp_scenarios_df = generate_price_scenarios_jump_diffusion(
+                initial_price=baseline_cp,
+                drift=config.get('jd_drift', global_sim_params.get('jd_drift', config.get('gbm_drift', global_sim_params['carbon_price_gbm_drift']))), # Fallback to GBM drift for placeholder
+                volatility=config.get('jd_volatility', global_sim_params.get('jd_volatility', cp_volatility)), # Fallback to scenario volatility for placeholder
+                jump_intensity=config.get('jd_jump_intensity', global_sim_params.get('jd_jump_intensity', 0.1)), # These params are for the actual JD model, but passed to placeholder
+                jump_mean=config.get('jd_jump_mean', global_sim_params.get('jd_jump_mean', 0.0)),
+                jump_std=config.get('jd_jump_std', global_sim_params.get('jd_jump_std', 0.15)),
+                horizon_days=horizon_days_for_cp_scenarios,
+                num_scenarios=n_scenarios_for_des,
+                start_datetime=scenario_gen_start_time
+            )
+            if cp_scenarios_df is not None:
+                experiment_summary["carbon_price_scenario_summary"]["model_used"] = "JumpDiffusion"
+                logging.info(f"Actual JumpDiffusion model successfully generated scenarios for {scenario_name}.")
+            else:
+                # This case implies the JumpDiffusion placeholder function itself returned None
+                logging.error(f"Actual JumpDiffusion model generation failed for {scenario_name} (returned None). Falling back to direct GBM call.")
+                experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_fallback_jumpdiffusion_failed"
+                cp_scenarios_df = generate_price_scenarios_gbm(
+                    initial_price=baseline_cp, drift=config.get('gbm_drift', global_sim_params['carbon_price_gbm_drift']),
+                    volatility=cp_volatility, horizon_days=horizon_days_for_cp_scenarios,
+                    num_scenarios=n_scenarios_for_des,start_datetime=scenario_gen_start_time)
+        except Exception as e_jd:
+            logging.error(f"Error during actual JumpDiffusion model execution for {scenario_name}: {e_jd}. Falling back to direct GBM call.")
+            experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_fallback_jumpdiffusion_exception"
+            cp_scenarios_df = generate_price_scenarios_gbm(
                 initial_price=baseline_cp, drift=config.get('gbm_drift', global_sim_params['carbon_price_gbm_drift']),
                 volatility=cp_volatility, horizon_days=horizon_days_for_cp_scenarios,
                 num_scenarios=n_scenarios_for_des,start_datetime=scenario_gen_start_time)
 
     elif carbon_model_to_use == "RegimeSwitching":
-        logging.info(f"Attempting RegimeSwitching model (placeholder) for {scenario_name}.")
-        default_rs_params1 = {'drift': 0.01, 'volatility': 0.10}
+        logging.info(f"Using actual RegimeSwitching model for {scenario_name}.")
+        default_rs_params1 = {'drift': 0.01, 'volatility': 0.10} 
         default_rs_params2 = {'drift': 0.05, 'volatility': 0.30}
-        default_rs_trans_matrix = [[0.95, 0.05], [0.03, 0.97]]
+        default_rs_trans_matrix = [[0.95, 0.05], [0.03, 0.97]] # P00, P01; P10, P11
 
         params_regime1 = config.get('rs_params_regime1', global_sim_params.get('rs_params_regime1', default_rs_params1))
         params_regime2 = config.get('rs_params_regime2', global_sim_params.get('rs_params_regime2', default_rs_params2))
         transition_matrix_list = config.get('rs_transition_matrix', global_sim_params.get('rs_transition_matrix', default_rs_trans_matrix))
-        transition_matrix = np.array(transition_matrix_list)
         
-        cp_scenarios_df = generate_price_scenarios_regime_switching(
-            initial_price=baseline_cp, params_regime1=params_regime1, params_regime2=params_regime2,
-            transition_matrix=transition_matrix, horizon_days=horizon_days_for_cp_scenarios,
-            num_scenarios=n_scenarios_for_des, start_datetime=scenario_gen_start_time
-        )
-        experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_via_RegimeSwitching_placeholder"
-        if cp_scenarios_df is None: # Should not happen
-             logging.error(f"RegimeSwitching placeholder unexpectedly returned None for {scenario_name}. THIS IS AN ISSUE.")
-             experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_fallback_regimeswitching_unexpected_None"
-        cp_scenarios_df = generate_price_scenarios_gbm(
+        # Ensure transition_matrix is a numpy array
+        try:
+            transition_matrix = np.array(transition_matrix_list)
+            if transition_matrix.shape != (2,2):
+                logging.error(f"Transition matrix for {scenario_name} has incorrect shape {transition_matrix.shape}. Expected (2,2). Using default.")
+                transition_matrix = np.array(default_rs_trans_matrix)
+        except Exception as e_tm_conversion:
+            logging.error(f"Error converting transition matrix for {scenario_name}: {e_tm_conversion}. Using default.")
+            transition_matrix = np.array(default_rs_trans_matrix)
+
+        try:
+            cp_scenarios_df = generate_price_scenarios_regime_switching(
+                initial_price=baseline_cp, 
+                params_regime1=params_regime1, 
+                params_regime2=params_regime2,
+                transition_matrix=transition_matrix, 
+                horizon_days=horizon_days_for_cp_scenarios,
+                num_scenarios=n_scenarios_for_des, 
+                start_datetime=scenario_gen_start_time
+            )
+            if cp_scenarios_df is not None:
+                experiment_summary["carbon_price_scenario_summary"]["model_used"] = "RegimeSwitching"
+                logging.info(f"Actual RegimeSwitching model successfully generated scenarios for {scenario_name}.")
+            else:
+                logging.error(f"Actual RegimeSwitching model generation failed for {scenario_name} (returned None). Falling back to direct GBM call.")
+                experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_fallback_regimeswitching_failed"
+                cp_scenarios_df = generate_price_scenarios_gbm(
+                    initial_price=baseline_cp, drift=config.get('gbm_drift', global_sim_params['carbon_price_gbm_drift']),
+                    volatility=cp_volatility, horizon_days=horizon_days_for_cp_scenarios,
+                    num_scenarios=n_scenarios_for_des,start_datetime=scenario_gen_start_time)
+        except Exception as e_rs:
+            logging.error(f"Error during actual RegimeSwitching model execution for {scenario_name}: {e_rs}. Falling back to direct GBM call.")
+            experiment_summary["carbon_price_scenario_summary"]["model_used"] = "GBM_fallback_regimeswitching_exception"
+            cp_scenarios_df = generate_price_scenarios_gbm(
                 initial_price=baseline_cp, drift=config.get('gbm_drift', global_sim_params['carbon_price_gbm_drift']),
                 volatility=cp_volatility, horizon_days=horizon_days_for_cp_scenarios,
                 num_scenarios=n_scenarios_for_des,start_datetime=scenario_gen_start_time)
@@ -262,21 +307,99 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
 
     # Moved Section: 4. Financial Option Pricing (Moved up)
     logging.info("Pricing financial options for stochastic DES inputs...")
-    priced_options_list = []
+    priced_instruments_list = []
     risk_free_rate = global_sim_params['risk_free_rate'] 
-    for spec in financial_option_specs: # financial_option_specs is from get_financial_option_specs()
-        price = price_european_option(spot_price=baseline_cp, 
-                                      strike_price=spec['strike_price'], 
-                                      time_to_maturity_years=spec['time_to_maturity_years'], 
-                                      risk_free_rate=risk_free_rate, 
-                                      volatility=cp_volatility, 
-                                      option_type=spec['option_type'])
-        priced_options_list.append({**spec, "price": price}) # Store full spec and add price
+    for spec in financial_instrument_specs:
+        instrument_type = spec.get('instrument_type', 'option')
+        
+        if instrument_type == 'option':
+            price = price_european_option(spot_price=baseline_cp, 
+                                          strike_price=spec['strike_price'], 
+                                          time_to_maturity_years=spec['time_to_maturity_years'], 
+                                          risk_free_rate=risk_free_rate, 
+                                          volatility=cp_volatility, 
+                                          option_type=spec['option_type'])
+            priced_instruments_list.append({**spec, "price": price, "premium": price})
+        elif instrument_type == 'futures':
+            price = get_futures_price(spot_price=baseline_cp,
+                                        risk_free_rate=risk_free_rate,
+                                        time_to_maturity_years=spec['time_to_maturity_years'])
+            priced_instruments_list.append({**spec, "price": price, "premium": 0.0})
+        elif instrument_type == 'swap':
+            time_to_maturity_years = spec['time_to_maturity_years']
+            # Maturity day index for cp_scenarios_df (0-indexed)
+            # approx_days_to_maturity = int(round(time_to_maturity_years * 365))
+            # Ensure we use the same horizon as the carbon price scenarios for consistency
+            # The swap rate is determined by the expected price AT that maturity day.
+            maturity_day_index = min(int(round(time_to_maturity_years * 365)), horizon_days_for_cp_scenarios) -1
+            maturity_day_index = max(0, maturity_day_index) # Ensure not negative if ttm is very short
 
-    logging.info(f"Priced {len(priced_options_list)} financial options for DES input.")
-    experiment_summary["financial_options_priced"] = priced_options_list # Save for summary
-    # display_option_prices can be called later, after DES, or here if preferred
-    # display_option_prices(priced_options_list, current_experiment_path, file_prefix=scenario_name + "_options_inputs")
+            if maturity_day_index < cp_scenarios_df.shape[0]:
+                carbon_prices_at_maturity = cp_scenarios_df.iloc[maturity_day_index]
+                fair_swap_rate = calculate_fair_swap_rate(carbon_prices_at_maturity)
+                priced_instruments_list.append({**spec, "price": fair_swap_rate, "premium": 0.0, "fixed_rate": fair_swap_rate})
+                logging.info(f"Calculated fair swap rate for {spec['name']} (maturity {time_to_maturity_years*12:.0f}M, day index {maturity_day_index+1}): {fair_swap_rate:.2f}")
+            else:
+                logging.warning(f"Maturity day index {maturity_day_index+1} for swap {spec['name']} is out of bounds for cp_scenarios_df (horizon {cp_scenarios_df.shape[0]} days). Skipping swap.")
+                priced_instruments_list.append({**spec, "price": np.nan, "premium": 0.0, "error": "Maturity out of bounds"})
+
+        else:
+            logging.warning(f"Unknown instrument type: {instrument_type} for spec {spec.get('name')}. Skipping.")
+            continue
+
+    # Process Collar Strategies
+    collar_strategy_specs = get_collar_strategy_specs() # Get collar definitions
+    if collar_strategy_specs:
+        logging.info(f"Processing {len(collar_strategy_specs)} collar strategy specifications...")
+        # Create a quick lookup for already priced instruments by name
+        priced_instrument_lookup = {inst['name']: inst for inst in priced_instruments_list}
+        
+        for collar_spec in collar_strategy_specs:
+            put_name = collar_spec.get('put_to_buy_name')
+            call_name = collar_spec.get('call_to_sell_name')
+            collar_name = collar_spec.get('name', f"Collar_{put_name}__{call_name}")
+
+            put_option = priced_instrument_lookup.get(put_name)
+            call_option = priced_instrument_lookup.get(call_name)
+
+            if put_option and call_option and put_option.get('instrument_type') == 'option' and call_option.get('instrument_type') == 'option':
+                if put_option.get('option_type', '').lower() != 'put' or call_option.get('option_type', '').lower() != 'call':
+                    logging.warning(f"Collar {collar_name}: Component {put_name} is not a Put or {call_name} is not a Call. Skipping.")
+                    continue
+                
+                put_premium = put_option.get('premium', np.nan)
+                call_premium = call_option.get('premium', np.nan)
+
+                if not np.isnan(put_premium) and not np.isnan(call_premium):
+                    net_collar_premium = put_premium - call_premium # Cost to buy put, revenue from selling call
+                    
+                    # Ensure critical details are present for the decision logic
+                    if 'strike_price' not in put_option or 'strike_price' not in call_option:
+                        logging.warning(f"Collar {collar_name}: Strike price missing for {put_name} or {call_name}. Skipping collar.")
+                        continue
+
+                    collar_details = {
+                        **collar_spec, # Includes name and component names from definition
+                        "instrument_type": "collar_strategy", # Override or ensure it's set
+                        "price": net_collar_premium, # Net cost/premium of the collar strategy
+                        "premium": net_collar_premium,
+                        "put_strike_price": put_option['strike_price'],
+                        "call_strike_price": call_option['strike_price'],
+                        "put_premium_component": put_premium,
+                        "call_premium_component": call_premium,
+                        # Include time_to_maturity if consistent for both legs, or handle appropriately
+                        # For simplicity, assume they share a maturity for now if defined that way
+                        "time_to_maturity_years": put_option.get('time_to_maturity_years') 
+                    }
+                    priced_instruments_list.append(collar_details)
+                    logging.info(f"Processed Collar Strategy '{collar_name}': Net Premium {net_collar_premium:.2f}")
+                else:
+                    logging.warning(f"Collar {collar_name}: Premium missing for component {put_name} or {call_name}. Skipping collar.")
+            else:
+                logging.warning(f"Collar {collar_name}: Component option {put_name} or {call_name} not found or not an option in priced_instruments. Skipping collar.")
+
+    logging.info(f"Total evaluated financial instruments (including strategies): {len(priced_instruments_list)}")
+    experiment_summary["financial_instruments_evaluated"] = priced_instruments_list
 
     # 1. Data Preparation for DES (Now after CP scenarios and option pricing)
     logging.info("Preparing DES data with stochastic inputs...")
@@ -296,19 +419,20 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
         "market_params": current_market_params, # Contains TOU, gas price, but NOT carbon price for DES model
         "grid_params": {'max_import_kw': global_sim_params['grid_max_import_export_kw'], 
                         'max_export_kw': global_sim_params['grid_max_import_export_kw']},
-        'option_list': [opt['name'] for opt in priced_options_list],
-        'option_strike_prices_cny_ton': {opt['name']: opt['strike_price'] for opt in financial_option_specs},
+        'option_list': [inst['name'] for inst in priced_instruments_list if inst['instrument_type'] == 'option'],
+        'option_strike_prices_cny_ton': {inst['name']: inst['strike_price'] for inst in priced_instruments_list if inst['instrument_type'] == 'option'},
         
         # Stochastic parts to be filled
         'scenarios': des_model_scenarios,
         'scenario_probabilities': des_scenario_probabilities,
         'carbon_prices_scenario_cny_ton': {}, # To be filled
-        'option_premiums_cny_contract': {opt['name']: opt['price'] for opt in priced_options_list},
+        'option_premiums_cny_contract': {},     # To be filled
         'option_payoffs_cny_contract': {},     # To be filled
 
         # CVaR Parameters for DES Model Objective
         'cvar_alpha_level': global_sim_params.get('cvar_alpha_level', 0.95), # Get from global_sim_params or default
-        'lambda_cvar_weight': global_sim_params.get('lambda_cvar_weight', 0.0) # Get from global_sim_params or default to 0 (no CVaR)
+        'lambda_cvar_weight': global_sim_params.get('lambda_cvar_weight', 0.0), # Get from global_sim_params or default to 0 (no CVaR)
+        'max_option_contracts_limit_abs': global_sim_params.get('max_option_contracts_limit_abs', 250) # Added for option contract limits
     }
     
     # Fill carbon_prices_scenario_cny_ton
@@ -327,20 +451,23 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
                 logging.warning(f"Hour index {t_hour_idx} (day {day_idx}) exceeds cp_scenario horizon ({len(cp_scenarios_df.index)} days) for scenario {s_label}. Using last available carbon price.")
                 des_data_inputs['carbon_prices_scenario_cny_ton'][(s_label, t_hour_idx)] = cp_scenarios_df[s_label].iloc[-1]
 
-
     # Fill option_premiums_cny_contract
-    for opt_data in priced_options_list: # priced_options_list contains dicts with 'name' and 'price'
-        des_data_inputs['option_premiums_cny_contract'][opt_data['name']] = opt_data['price']
+    for inst_data in priced_instruments_list:
+        if inst_data['instrument_type'] == 'option':
+            des_data_inputs['option_premiums_cny_contract'][inst_data['name']] = inst_data.get('premium', 0.0)
 
     # Fill option_payoffs_cny_contract
     # Payoff is calculated based on the average carbon price over the option's life,
     # but relevant to the DES operational period.
-    for opt_data in priced_options_list: # Iterating through the same list, which now includes 'price' and all specs
-        opt_label = opt_data['name']
-        strike_price = opt_data['strike_price']
-        option_type = opt_data['option_type']
+    for inst_data in priced_instruments_list:
+        if inst_data['instrument_type'] != 'option':
+            continue
+        
+        opt_label = inst_data['name']
+        strike_price = inst_data['strike_price']
+        option_type = inst_data['option_type']
         # Maturity in days from years, relative to start of carbon price scenarios
-        maturity_in_days_config = int(opt_data['time_to_maturity_years'] * 365)
+        maturity_in_days_config = int(inst_data['time_to_maturity_years'] * 365)
 
         for s_label in des_model_scenarios:
             # Determine the number of days relevant for payoff calculation within this DES run.
@@ -372,13 +499,61 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
                     avg_carbon_price_for_payoff = relevant_daily_prices.mean()
 
             payoff = 0.0
-            if option_type == 'call':
-                payoff = max(0.0, avg_carbon_price_for_payoff - strike_price)
-            elif option_type == 'put': # Assuming only call/put
-                payoff = max(0.0, strike_price - avg_carbon_price_for_payoff)
+            debug_strike_info = "N/A"
+
+            if inst_data['instrument_type'] == 'collar_strategy':
+                K_put=inst_data['put_strike_price']
+                K_call=inst_data['call_strike_price']
+                payoff = calculate_collar_payoff(
+                    S=avg_carbon_price_for_payoff, 
+                    K_put=K_put, 
+                    K_call=K_call
+                )
+                debug_strike_info = f"PutK:{K_put}, CallK:{K_call}"
+            elif option_type.lower() == 'call': 
+                current_strike = strike_price
+                payoff = max(0.0, avg_carbon_price_for_payoff - current_strike)
+                debug_strike_info = f"Strike:{current_strike}"
+            elif option_type.lower() == 'put':
+                current_strike = strike_price
+                payoff = max(0.0, current_strike - avg_carbon_price_for_payoff)
+                debug_strike_info = f"Strike:{current_strike}"
             
+            logging.info(f"DEBUG_PAYOFF_CALC: opt:{opt_label}, scen:{s_label}, type:{inst_data['instrument_type']}/{option_type}, avg_cp:{avg_carbon_price_for_payoff:.2f}, {debug_strike_info}, CALC_PAYOFF:{payoff:.4f}")
+            
+            # All other instrument_overall_type (futures, swap) will have payoff = 0.0, which is correct as they are not options.
             des_data_inputs['option_payoffs_cny_contract'][(opt_label, s_label)] = payoff
     
+    # ---- START DEBUGGING BLOCK for test_gbm_model ----
+    if scenario_name == "test_gbm_model":
+        options_to_debug = ["Put_300_1M", "Call_300_1M", "Call_280_1M", "Collar_1M_P300"]
+        logging.info(f"DEBUG_DES_INPUTS for {scenario_name}:")
+        for opt_name_debug in options_to_debug:
+            if opt_name_debug in des_data_inputs['option_premiums_cny_contract']:
+                logging.info(f"  {opt_name_debug} - Premium: {des_data_inputs['option_premiums_cny_contract'][opt_name_debug]}")
+            else:
+                logging.info(f"  {opt_name_debug} - Premium: NOT FOUND")
+
+            logging.info(f"  {opt_name_debug} - Payoffs (first 3 scenarios):")
+            for s_idx, s_label_debug in enumerate(des_model_scenarios[:3]): # Log for first 3 scenarios
+                payoff_val = des_data_inputs['option_payoffs_cny_contract'].get((opt_name_debug, s_label_debug), "NOT FOUND")
+                
+                # To provide context, find the average carbon price used for this payoff.
+                # This requires knowing the maturity_in_days_config for this specific option.
+                avg_cp_for_payoff_debug = "N/A"
+                maturity_in_days_debug = "N/A"
+                for inst_data_debug in priced_instruments_list:
+                    if inst_data_debug['name'] == opt_name_debug:
+                        maturity_in_days_debug = int(inst_data_debug['time_to_maturity_years'] * 365)
+                        days_for_payoff_calc_debug = min(maturity_in_days_debug, horizon_days_for_cp_scenarios)
+                        if days_for_payoff_calc_debug > 0:
+                            relevant_daily_prices_debug = cp_scenarios_df[s_label_debug].iloc[0:days_for_payoff_calc_debug]
+                            if not relevant_daily_prices_debug.empty:
+                                avg_cp_for_payoff_debug = f"{relevant_daily_prices_debug.mean():.2f}"
+                        break
+                logging.info(f"    {s_label_debug}: Payoff = {payoff_val}, Avg CP for Payoff ({days_for_payoff_calc_debug}d) = {avg_cp_for_payoff_debug}")
+    # ---- END DEBUGGING BLOCK ----
+
     # DEBUG: Print calculated payoffs for a specific option to verify
     if scenario_name == "test_garch_model": # Or any scenario you are testing
         target_option_to_debug = 'Call_280_1M'
@@ -397,6 +572,20 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
             if s_idx < 5 or payoff_val > 0 or (target_option_to_debug == 'Call_280_1M' and payoff_val == 0.0) :
                 logging.info(f"  Scenario {s_label_debug}: Payoff = {payoff_val}, AvgPrice = {avg_carbon_price_for_payoff:.2f}, Strike = {strike_price}, Days = {days_for_payoff_calc}")
         logging.info(f"DEBUG: Summary for {target_option_to_debug}: Total expected payoff (calculated here) = {total_expected_payoff_debug}, Num scenarios with positive payoff = {num_positive_payoff_scenarios}/{len(des_model_scenarios)}")
+
+    # ---- START MODIFICATION FOR test_gbm_model ----
+    if scenario_name == "test_gbm_model":
+        original_lambda = des_data_inputs.get('lambda_cvar_weight', 'Not Set')
+        des_data_inputs['lambda_cvar_weight'] = 100.0
+        logging.info(f"Applied MODIFICATION for {scenario_name}: lambda_cvar_weight changed from {original_lambda} to {des_data_inputs['lambda_cvar_weight']}")
+        
+        if 'Call_280_1M' in des_data_inputs.get('option_premiums_cny_contract', {}):
+            original_premium = des_data_inputs['option_premiums_cny_contract']['Call_280_1M']
+            des_data_inputs['option_premiums_cny_contract']['Call_280_1M'] /= 2
+            logging.info(f"Applied MODIFICATION for {scenario_name}: 'Call_280_1M' premium changed from {original_premium} to {des_data_inputs['option_premiums_cny_contract']['Call_280_1M']}")
+        else:
+            logging.warning(f"MODIFICATION for {scenario_name}: 'Call_280_1M' not found in option_premiums_cny_contract. Premium not changed.")
+    # ---- END MODIFICATION FOR test_gbm_model ----
 
     # 2. DES Optimization (Now uses stochastic inputs)
     logging.info("Building and solving STOCHASTIC DES model...")
@@ -529,7 +718,7 @@ def run_single_experiment(config, base_output_path, global_sim_params, chp_param
 
     op_decision_details = make_operational_hedging_decision(
         des_summary=des_summary_dict,
-        priced_options=priced_options_list,
+        priced_instruments=priced_instruments_list,
         carbon_price_scenarios_df=cp_scenarios_df,
         operational_params=operational_params_for_decision
     )
@@ -593,7 +782,7 @@ def main():
         {
             "name": "test_gbm_model",
             "baseline_carbon_price": 300.0,
-            "carbon_price_volatility": 0.20,
+            "carbon_price_volatility": 0.80,
             "carbon_price_model_type": "GBM"
         },
         {
@@ -639,7 +828,7 @@ def main():
     general_sim_params = get_simulation_parameters()
     chp_parameters_static = get_chp_parameters()
     bess_parameters_static = get_bess_parameters()
-    financial_option_specs_static = get_financial_option_specs()
+    financial_instrument_specs_static = get_financial_instrument_specs()
 
     aggregated_results = []
     for config_item in experiment_configs: 
@@ -653,7 +842,7 @@ def main():
             chp_parameters_static,
             bess_parameters_static,
             get_market_parameters, 
-            financial_option_specs_static,
+            financial_instrument_specs_static,
             get_roa_ccs_project_parameters 
         )
         aggregated_results.append({

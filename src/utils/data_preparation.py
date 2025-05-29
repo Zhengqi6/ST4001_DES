@@ -32,7 +32,7 @@ CCS_PROJECT_LIFETIME_YEARS = 15
 CCS_MAX_DEFERRAL_YEARS = 3
 
 # Global Simulation Parameters (Centralized)
-DES_OPTIMIZATION_HORIZON_HOURS = 24 * 7 # E.g., 7 days
+DES_OPTIMIZATION_HORIZON_HOURS = 24 * 30 # E.g., 7 days
 NUM_CARBON_PRICE_SCENARIOS = 30
 CARBON_SCENARIO_HORIZON_DAYS = 90
 CARBON_PRICE_GBM_DRIFT = 0.08  # Annual drift for GBM
@@ -152,23 +152,68 @@ def get_market_parameters(baseline_carbon_price=None):
         'carbon_price_cny_per_ton': effective_carbon_price # Use the effective carbon price
     }
 
-def get_financial_option_specs():
+def get_financial_instrument_specs():
     """
-    Generates a list of financial option product configurations.
-    Each product is defined by its type (Call/Put), strike price, and maturity.
-    Example: {'type': 'Call', 'strike_cny_ton': 180, 'maturity_months': 1, 'name': 'Call_180_1M'}
+    Generates a list of financial instrument product configurations.
+    Each product is defined by its type (e.g., Option, Futures), and specific parameters.
+    Example Option: {'instrument_type': 'option', 'option_type': 'Call', 'strike_price': 180, 'time_to_maturity_years': 1/12, 'name': 'Call_180_1M'}
+    Example Futures: {'instrument_type': 'futures', 'time_to_maturity_years': 1/12, 'name': 'Futures_1M'}
     """
-    option_specs = [
+    instrument_specs = [
+        # Options
         # 1-Month Maturity Options
-        {"option_type": "Call", "strike_price": 280, "time_to_maturity_years": 1/12, "name": "Call_280_1M"},
-        {"option_type": "Call", "strike_price": 300, "time_to_maturity_years": 1/12, "name": "Call_300_1M"},
-        {"option_type": "Call", "strike_price": 330, "time_to_maturity_years": 1/12, "name": "Call_330_1M"},
+        {"instrument_type": "option", "option_type": "Call", "strike_price": 280, "time_to_maturity_years": 1/12, "name": "Call_280_1M"},
+        {"instrument_type": "option", "option_type": "Call", "strike_price": 300, "time_to_maturity_years": 1/12, "name": "Call_300_1M"},
+        {"instrument_type": "option", "option_type": "Call", "strike_price": 330, "time_to_maturity_years": 1/12, "name": "Call_330_1M"},
+        {"instrument_type": "option", "option_type": "Put", "strike_price": 280, "time_to_maturity_years": 1/12, "name": "Put_280_1M"},
+        {"instrument_type": "option", "option_type": "Put", "strike_price": 300, "time_to_maturity_years": 1/12, "name": "Put_300_1M"},
+
         # 3-Month Maturity Options
-        {"option_type": "Call", "strike_price": 280, "time_to_maturity_years": 3/12, "name": "Call_280_3M"},
-        {"option_type": "Call", "strike_price": 300, "time_to_maturity_years": 3/12, "name": "Call_300_3M"},
-        {"option_type": "Call", "strike_price": 330, "time_to_maturity_years": 3/12, "name": "Call_330_3M"},
+        {"instrument_type": "option", "option_type": "Call", "strike_price": 280, "time_to_maturity_years": 3/12, "name": "Call_280_3M"},
+        {"instrument_type": "option", "option_type": "Call", "strike_price": 300, "time_to_maturity_years": 3/12, "name": "Call_300_3M"},
+        {"instrument_type": "option", "option_type": "Call", "strike_price": 330, "time_to_maturity_years": 3/12, "name": "Call_330_3M"},
+        {"instrument_type": "option", "option_type": "Put", "strike_price": 280, "time_to_maturity_years": 3/12, "name": "Put_280_3M"},
+        {"instrument_type": "option", "option_type": "Put", "strike_price": 300, "time_to_maturity_years": 3/12, "name": "Put_300_3M"},
+        
+        # Futures Contracts
+        {"instrument_type": "futures", "time_to_maturity_years": 1/12, "name": "Futures_1M"},
+        {"instrument_type": "futures", "time_to_maturity_years": 3/12, "name": "Futures_3M"},
+
+        # Carbon Swaps (Fixed-for-Floating)
+        {"instrument_type": "swap", "time_to_maturity_years": 1/12, "name": "Swap_1M"},
+        {"instrument_type": "swap", "time_to_maturity_years": 3/12, "name": "Swap_3M"},
     ]
-    return option_specs
+    return instrument_specs
+
+def get_collar_strategy_specs():
+    """
+    Defines a list of collar strategy configurations.
+    Each collar references a put option to buy and a call option to sell by name.
+    These underlying options must be defined in get_financial_instrument_specs().
+    Example: {'name': 'Collar_1M_280P_330C', 'put_to_buy_name': 'Put_280_1M', 'call_to_sell_name': 'Call_330_1M'}
+    """
+    collar_specs = [
+        {
+            "name": "Collar_1M_P280_C330",
+            "put_to_buy_name": "Put_280_1M",
+            "call_to_sell_name": "Call_330_1M",
+            "instrument_type": "collar_strategy" # To help identify it later
+        },
+        {
+            "name": "Collar_3M_P280_C330",
+            "put_to_buy_name": "Put_280_3M",
+            "call_to_sell_name": "Call_330_3M",
+            "instrument_type": "collar_strategy"
+        },
+        # Potentially a zero-cost collar (or close to it) - strikes would need careful selection based on typical pricing
+        {
+            "name": "Collar_1M_P300_C300", # Example of selling and buying at same strike (would be a synthetic future, effectively)
+            "put_to_buy_name": "Put_300_1M",
+            "call_to_sell_name": "Call_300_1M",
+            "instrument_type": "collar_strategy"
+        }
+    ]
+    return collar_specs
 
 def get_roa_ccs_project_parameters():
     # Parameters for the CCS addition Real Option Analysis
@@ -234,8 +279,15 @@ if __name__ == '__main__':
     market_params = get_market_parameters()
     print("Market Parameters:\n", market_params)
     
-    fin_options = get_financial_option_specs()
-    print("Financial Option Specs:\n", fin_options)
+    fin_instruments = get_financial_instrument_specs()
+    print("Financial Instrument Specs:\n")
+    for item in fin_instruments:
+        print(item)
+
+    collar_strats = get_collar_strategy_specs()
+    print("\nCollar Strategy Specs:\n")
+    for item in collar_strats:
+        print(item)
 
     roa_params = get_roa_ccs_project_parameters()
     print("ROA CCS Project Parameters:\n", roa_params)

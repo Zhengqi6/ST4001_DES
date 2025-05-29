@@ -94,7 +94,12 @@ def build_des_model(data_inputs):
 
     # --- VARIABLES ---
     # First-stage variables (Option Purchase) - decided before scenario realization
-    model.v_buy_option_contracts = Var(model.OPT, domain=NonNegativeReals) # Number of option contracts to buy for each type
+    # Define bounds for option contracts
+    max_contracts = data_inputs.get('max_option_contracts_limit_abs', 250) # Default to +/- 250 if not provided
+    def option_bounds_rule(m, opt):
+        return (-max_contracts, max_contracts)
+    
+    model.v_buy_option_contracts = Var(model.OPT, domain=Reals, bounds=option_bounds_rule) # Number of option contracts to buy (positive) or sell (negative)
 
     # Second-stage variables (Operational) - scenario-dependent
     # PV
@@ -412,7 +417,8 @@ def extract_results(model, data_inputs):
     exp_total_grid_import_kwh = 0
     exp_total_grid_export_kwh = 0
 
-    for s in model.S:
+    logging.info("DEBUG_EXTRACT_RESULTS: Calculating expected option payoffs...")
+    for s_idx, s in enumerate(model.S):
         prob_s = model.p_scenario_prob[s]
 
         # Costs for this scenario
@@ -421,18 +427,31 @@ def extract_results(model, data_inputs):
         scen_chp_fuel_consumption_m3 = safe_val(model.e_chp_fuel_consumption_m3_scen[s])
         scen_chp_fuel_cost = scen_chp_fuel_consumption_m3 * model.p_gas_price_cny_m3
         scen_gross_carbon_cost = safe_val(model.e_gross_carbon_cost_scen[s])
-        scen_option_payoff = safe_val(model.e_options_total_payoff_scen[s]) # Payoff from *purchased* options
-        scen_net_carbon_cost = scen_gross_carbon_cost - scen_option_payoff
-        scen_total_chp_co2_emissions_ton = safe_val(model.e_chp_co2_emissions_ton_scen[s])
+        
+        # Detailed logging for option payoff calculation for this scenario
+        scen_option_payoff_val = safe_val(model.e_options_total_payoff_scen[s])
+        if s_idx < 3: # Log details only for the first few scenarios to avoid excessive output
+            logging.info(f"  DEBUG_EXTRACT_RESULTS: Scenario {s} (Prob: {prob_s:.4f}):")
+            logging.info(f"    model.e_options_total_payoff_scen[{s}] = {scen_option_payoff_val:.4f}")
+            for opt_idx, opt_label_debug in enumerate(model.OPT):
+                contracts_val = safe_val(model.v_buy_option_contracts[opt_label_debug])
+                unit_payoff_val = model.p_option_period_payoff_cny_contract[opt_label_debug, s]
+                total_contrib = contracts_val * unit_payoff_val
+                if abs(contracts_val) > 1e-4 or abs(unit_payoff_val) > 1e-4 : # Log if significant
+                    logging.info(f"      Opt {opt_idx}: {opt_label_debug} -> Contracts: {contracts_val:.2f}, UnitPayoff(buyer): {unit_payoff_val:.4f}, Contribution: {total_contrib:.4f}")
+        
+        # Expected Net Carbon Cost for this scenario (for checking)
+        scen_net_carbon_cost_val = safe_val(model.e_net_carbon_cost_scen[s]) # Correct way
+        logging.info(f"    model.e_net_carbon_cost_scen[{s}] (Gross - OptPayoff) = {scen_net_carbon_cost_val:.2f}") # Corrected line
 
+        exp_option_period_payoff += prob_s * scen_option_payoff_val
         exp_grid_buy_cost += prob_s * scen_grid_buy_cost
         exp_grid_sell_revenue += prob_s * scen_grid_sell_revenue
         exp_chp_fuel_cost += prob_s * scen_chp_fuel_cost
         exp_chp_fuel_consumption_m3 += prob_s * scen_chp_fuel_consumption_m3
         exp_gross_carbon_cost += prob_s * scen_gross_carbon_cost
-        exp_option_period_payoff += prob_s * scen_option_payoff
-        exp_net_carbon_cost += prob_s * scen_net_carbon_cost
-        exp_total_chp_co2_emissions_ton += prob_s * scen_total_chp_co2_emissions_ton
+        exp_net_carbon_cost += prob_s * scen_net_carbon_cost_val
+        exp_total_chp_co2_emissions_ton += prob_s * scen_chp_fuel_consumption_m3 * model.p_chp_co2_ton_m3_gas
         
         # Summing hourly physical quantities for scenario s, then weighting by probability
         exp_total_pv_gen_e_kwh += prob_s * sum(safe_val(model.v_pv_gen_e[s,t]) for t in model.T)

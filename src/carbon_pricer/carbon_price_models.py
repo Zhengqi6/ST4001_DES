@@ -154,31 +154,147 @@ def generate_price_scenarios_garch(garch_fit, initial_price, horizon_days, num_s
 
 def generate_price_scenarios_jump_diffusion(initial_price, drift, volatility, jump_intensity, jump_mean, jump_std, horizon_days, num_scenarios, start_datetime=None):
     """
-    Generates carbon price paths using a Merton Jump-Diffusion Model (placeholder).
-    Actual implementation would require more sophisticated handling of jump processes.
+    Generates carbon price paths using a Merton Jump-Diffusion Model.
+    The model for the log-price d(lnS) is:
+    d(lnS_t) = (mu - lambda*kappa - 0.5*sigma^2)dt + sigma*dW_t + dN_t * Y_jump
+    where:
+    - mu is the total drift (config: 'drift')
+    - sigma is the volatility of the Brownian motion part (config: 'volatility')
+    - lambda is the jump intensity (average number of jumps per year) (config: 'jump_intensity')
+    - dW_t is the Wiener process
+    - N_t is a Poisson process with intensity lambda. dN_t = 1 if jump, 0 otherwise.
+    - Y_jump is the log of the jump size, Y_jump ~ N(jump_mean_log, jump_std_log^2).
+      We take 'jump_mean' as jump_mean_log and 'jump_std' as jump_std_log.
+    - kappa = E[exp(Y_jump)-1] = exp(jump_mean_log + 0.5*jump_std_log^2) - 1. This is the expected relative jump size if Y is the multiplier S_after/S_before.
+    The term (mu - lambda*kappa) is the drift of the continuous part of the price process dS/S.
+    The term (mu - lambda*kappa - 0.5*sigma^2) is the drift of the d(lnS) process's continuous part.
     """
-    print(f"Warning: generate_price_scenarios_jump_diffusion is a placeholder and currently falls back to GBM.")
-    # Placeholder: For now, falls back to GBM for structure. 
-    # A full implementation would discretize the jump-diffusion process:
-    # dS/S = (mu - lambda*kappa)dt + sigma*dW_t + dJ_t
-    # where dJ_t is a compound Poisson process. kappa is E[Y-1] where Y is jump size.
-    # For simplicity, the GBM function is called here. Replace with actual jump-diffusion logic.
-    return generate_price_scenarios_gbm(initial_price, drift, volatility, horizon_days, num_scenarios, start_datetime)
+    dt = 1/252  # Daily steps, assuming 252 trading days a year
+
+    # Calculate kappa: E[exp(Y_jump) - 1]
+    # Y_jump is log(JumpSizeMultiplier), so JumpSizeMultiplier = exp(Y_jump)
+    # E[JumpSizeMultiplier] = exp(jump_mean + 0.5 * jump_std**2)
+    kappa = np.exp(jump_mean + 0.5 * jump_std**2) - 1
+
+    # Adjusted drift for the continuous part of d(lnS)
+    # This is mu' = mu - lambda*kappa for the price process dS/S = mu'*dt + sigma*dW + (Y-1)*dN
+    # For d(lnS) = (mu' - 0.5*sigma^2)dt + sigma*dW + Y_jump*dN
+    # where mu is the overall expected return E[dS/S]/dt
+    # The drift for the GBM component of log-returns:
+    gbm_drift_log = drift - jump_intensity * kappa - 0.5 * volatility**2
+
+    paths = []
+    for i in range(num_scenarios):
+        log_prices = [np.log(initial_price)]
+        for _ in range(1, horizon_days):
+            # Continuous part (GBM)
+            gbm_increment = gbm_drift_log * dt + volatility * np.sqrt(dt) * np.random.normal()
+
+            # Jump part
+            jump_val_log = 0.0
+            if np.random.poisson(jump_intensity * dt) > 0: # Check if a jump occurs in this dt
+                # Draw jump size (log of the multiplicative factor)
+                jump_val_log = np.random.normal(jump_mean, jump_std)
+            
+            current_log_price = log_prices[-1] + gbm_increment + jump_val_log
+            log_prices.append(current_log_price)
+        paths.append(np.exp(log_prices))
+
+    prices_array = np.array(paths).T # Transpose so rows are time, columns are scenarios
+
+    if start_datetime is None:
+        start_datetime = datetime.datetime.now()
+
+    timestamps = []
+    current_time = start_datetime
+    for _ in range(horizon_days):
+        timestamps.append(current_time)
+        current_time += datetime.timedelta(days=1)
+
+    df_prices = pd.DataFrame(prices_array, index=timestamps[:horizon_days],
+                             columns=[f'scenario_{i+1}' for i in range(num_scenarios)])
+    return df_prices
 
 def generate_price_scenarios_regime_switching(initial_price, params_regime1, params_regime2, transition_matrix, horizon_days, num_scenarios, start_datetime=None):
     """
-    Generates carbon price paths using a Regime-Switching Model (placeholder).
-    Actual implementation would involve simulating state transitions and regime-specific dynamics.
-    params_regime1/2 should be dicts like {'drift': ..., 'volatility': ...}
-    transition_matrix is a 2x2 np.array for probabilities P_ij.
+    Generates carbon price paths using a Regime-Switching Model.
+    Switches between two GBM regimes based on a transition matrix.
+    The log-price d(lnS) in regime i follows:
+    d(lnS_t) = (mu_i - 0.5*sigma_i^2)dt + sigma_i*dW_t
+    params_regime1/2: dicts with {'drift': float, 'volatility': float} for regime 0 and 1 respectively.
+                      'drift' is mu_i, 'volatility' is sigma_i.
+    transition_matrix: 2x2 numpy array, P_ij = probability of moving from regime i to regime j in the next step.
+                       [[P_00, P_01], [P_10, P_11]]
+                       Rows must sum to 1. P_01 is prob of switching from 0 to 1. P_10 is prob of switching from 1 to 0.
     """
-    print(f"Warning: generate_price_scenarios_regime_switching is a placeholder and currently falls back to GBM using regime1 params.")
-    # Placeholder: For now, falls back to GBM using parameters from the first regime for structure.
-    # A full implementation would:
-    # 1. Simulate the state (regime) sequence using the transition_matrix.
-    # 2. For each time step, apply the drift and volatility of the current regime.
-    # This is a simplified fallback.
-    return generate_price_scenarios_gbm(initial_price, params_regime1.get('drift', 0.02), params_regime1.get('volatility', 0.2), horizon_days, num_scenarios, start_datetime)
+    dt = 1/252  # Daily steps
+
+    regime_params = [params_regime1, params_regime2] # Store params in a list for easy access
+
+    # Validate transition matrix rows sum to 1 (approximately)
+    if not (np.allclose(np.sum(transition_matrix, axis=1), 1.0)):
+        raise ValueError("Rows of the transition matrix must sum to 1.")
+
+    paths = []
+    for i in range(num_scenarios):
+        log_prices = [np.log(initial_price)]
+        # Assume starting in regime 0 for all scenarios.
+        # A more advanced approach could use stationary distribution of the Markov chain if it exists and is unique.
+        current_regime = 0 
+        
+        regime_drifts = [p.get('drift', 0.0) for p in regime_params]
+        regime_vols = [p.get('volatility', 0.0) for p in regime_params]
+
+        for _ in range(1, horizon_days):
+            drift_val = regime_drifts[current_regime]
+            vol_val = regime_vols[current_regime]
+
+            # Log-price increment for the current regime
+            log_increment = (drift_val - 0.5 * vol_val**2) * dt + vol_val * np.sqrt(dt) * np.random.normal()
+            current_log_price = log_prices[-1] + log_increment
+            log_prices.append(current_log_price)
+
+            # Determine next regime
+            rand_val = np.random.rand()
+            if current_regime == 0:
+                if rand_val > transition_matrix[0, 0]: # Prob of staying in 0 is P_00
+                    current_regime = 1 # Switch to regime 1 (with prob P_01 = 1 - P_00)
+            else: # current_regime == 1
+                if rand_val > transition_matrix[1, 1]: # Prob of staying in 1 is P_11
+                    current_regime = 0 # Switch to regime 0 (with prob P_10 = 1 - P_11)
+        
+        paths.append(np.exp(log_prices))
+
+    prices_array = np.array(paths).T
+
+    if start_datetime is None:
+        start_datetime = datetime.datetime.now()
+
+    timestamps = []
+    current_time = start_datetime
+    for _ in range(horizon_days):
+        timestamps.append(current_time)
+        current_time += datetime.timedelta(days=1)
+
+    df_prices = pd.DataFrame(prices_array, index=timestamps[:horizon_days],
+                             columns=[f'scenario_{i+1}' for i in range(num_scenarios)])
+    return df_prices
+
+# --- Advanced Model Implementations (Conceptual Placeholders) ---
+# These would require significant additional work and data for calibration.
+
+# For Kou Jump Diffusion (double exponential jumps):
+# def generate_price_scenarios_kou_jump_diffusion(...):
+#     pass # Placeholder for Kou model
+
+# For Heston Stochastic Volatility:
+# def generate_price_scenarios_heston(...):
+#     pass # Placeholder for Heston model
+
+# For Bates (Stochastic Volatility + Jumps):
+# def generate_price_scenarios_bates(...):
+#     pass # Placeholder for Bates model
+
 
 if __name__ == '__main__':
     # Demo for GBM
@@ -256,7 +372,7 @@ if __name__ == '__main__':
         start_datetime=demo_start_time
     )
     if jump_diffusion_scenarios is not None:
-        print("Jump-Diffusion Scenarios Head (Placeholder Fallback to GBM):")
+        print("Jump-Diffusion Scenarios Head:")
         print(jump_diffusion_scenarios.head())
 
     # Demo for Regime-Switching (Placeholder)
@@ -276,7 +392,7 @@ if __name__ == '__main__':
         start_datetime=demo_start_time
     )
     if regime_switching_scenarios is not None:
-        print("Regime-Switching Scenarios Head (Placeholder Fallback to GBM with Regime1 Params):")
+        print("Regime-Switching Scenarios Head:")
         print(regime_switching_scenarios.head())
 
     # Example of how it might be used in the main script:
@@ -298,3 +414,83 @@ if __name__ == '__main__':
     #     print("\nFinal Selected Scenarios (example):")
     #     print(final_scenarios.head())
     #     # final_scenarios.to_csv("carbon_price_scenarios_example.csv")
+
+    # --- Example Usage ---
+    test_start_time = datetime.datetime(2024, 1, 1, 10, 30, 0) # Example fixed start time
+
+    # 1. Synthetic Historical Prices for GARCH
+    print("\n--- Generating Synthetic Historical Prices for GARCH ---")
+    hist_prices = generate_synthetic_historical_prices(days=500, initial_price=140, mu=0.015, sigma=0.25)
+    print(f"Shape of GARCH historical prices: {hist_prices.shape}")
+    print(hist_prices.head())
+
+    # 2. Fit GARCH model
+    if not hist_prices.empty:
+        garch_model_fit = fit_garch_model(hist_prices)
+        if garch_model_fit:
+            print("\nGARCH Model Summary:")
+            print(garch_model_fit.summary())
+            
+            # 3. Generate scenarios from fitted GARCH
+            garch_scenarios = generate_price_scenarios_garch(
+                garch_fit=garch_model_fit,
+                initial_price=140, # Start scenarios from the current price
+                horizon_days=60,
+                num_scenarios=3,
+                start_datetime=test_start_time
+            )
+            if garch_scenarios is not None:
+                print("\nGARCH Scenarios Head:")
+                print(garch_scenarios.head())
+                print(f"Shape of GARCH scenarios: {garch_scenarios.shape}")
+                if not garch_scenarios.empty:
+                     print(f"Timestamps from {garch_scenarios.index[0]} to {garch_scenarios.index[-1]}")
+
+            else:
+                print("Failed to generate GARCH scenarios.")
+        else:
+            print("Failed to fit GARCH model. Skipping GARCH scenario generation.")
+    else:
+        print("Historical prices are empty. Skipping GARCH.")
+
+    # 4. Jump-Diffusion Model Example (currently falls back to GBM)
+    print("\n--- Generating Jump-Diffusion Model Scenarios (Placeholder Fallback to GBM) ---")
+    jd_params = {'drift': 0.05, 'volatility': 0.2}
+    jd_scenarios = generate_price_scenarios_jump_diffusion(
+        initial_price=100,
+        drift=jd_params['drift'],
+        volatility=jd_params['volatility'],
+        jump_intensity=0.1, # Example: average 0.1 jumps per year
+        jump_mean=0.0,    # Example: mean jump size (log terms)
+        jump_std=0.1,     # Example: std dev of jump size (log terms)
+        horizon_days=60,
+        num_scenarios=3,
+        start_datetime=test_start_time
+    )
+    print(f"Shape of Jump-Diffusion scenarios: {jd_scenarios.shape}")
+    print(jd_scenarios.head())
+
+    # 5. Regime-Switching Model Example (currently falls back to GBM)
+    print("\n--- Generating Regime-Switching Model Scenarios (Placeholder Fallback to GBM) ---")
+    rs_params1 = {'drift': 0.01, 'volatility': 0.15}
+    rs_params2 = {'drift': 0.05, 'volatility': 0.35}
+    rs_trans_matrix = np.array([[0.98, 0.02], [0.03, 0.97]])
+    rs_scenarios = generate_price_scenarios_regime_switching(
+        initial_price=200, 
+        params_regime1=rs_params1, 
+        params_regime2=rs_params2,
+        transition_matrix=rs_trans_matrix,
+        horizon_days=60, 
+        num_scenarios=3,
+        start_datetime=test_start_time
+    )
+    print(f"Shape of Regime-Switching (GBM fallback) scenarios: {rs_scenarios.shape}")
+    print(rs_scenarios.head())
+
+    # Testing the placeholder functions directly for their fallback messages
+    print("\n--- Direct Test of Placeholder Fallback Messages ---")
+    print("Testing Jump-Diffusion placeholder direct call:")
+    _ = generate_price_scenarios_jump_diffusion(100, 0.05, 0.2, 0.1, 0, 0.1, 10, 2, test_start_time)
+
+    print("\nTesting Regime-Switching placeholder direct call:")
+    _ = generate_price_scenarios_regime_switching(100, rs_params1, rs_params2, rs_trans_matrix, 10, 2, test_start_time)
